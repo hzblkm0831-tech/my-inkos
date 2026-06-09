@@ -1,3 +1,9 @@
+/**
+ * Modified by Antigravity (AI Coding Assistant) on 2026-06-08
+ * - Added `executeWithRetry` wrapper to chatCompletion and chatWithTools.
+ * - Implemented exponential backoff retries for HTTP 429 / Rate Limit / Quota Exceeded errors.
+ */
+
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import type { LLMConfig } from "../models/project.js";
