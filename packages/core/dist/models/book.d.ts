@@ -1,0 +1,51 @@
+import { z } from "zod";
+export declare const PlatformSchema: z.ZodEnum<["tomato", "feilu", "qidian", "other"]>;
+export type Platform = z.infer<typeof PlatformSchema>;
+export declare const GenreSchema: z.ZodString;
+export type Genre = z.infer<typeof GenreSchema>;
+export declare const BookStatusSchema: z.ZodEnum<["incubating", "outlining", "active", "paused", "completed", "dropped"]>;
+export type BookStatus = z.infer<typeof BookStatusSchema>;
+export declare const FanficModeSchema: z.ZodEnum<["canon", "au", "ooc", "cp"]>;
+export type FanficMode = z.infer<typeof FanficModeSchema>;
+export declare const BookConfigSchema: z.ZodObject<{
+    id: z.ZodString;
+    title: z.ZodString;
+    platform: z.ZodEnum<["tomato", "feilu", "qidian", "other"]>;
+    genre: z.ZodString;
+    status: z.ZodEnum<["incubating", "outlining", "active", "paused", "completed", "dropped"]>;
+    targetChapters: z.ZodDefault<z.ZodNumber>;
+    chapterWordCount: z.ZodDefault<z.ZodNumber>;
+    language: z.ZodOptional<z.ZodEnum<["zh", "en"]>>;
+    createdAt: z.ZodString;
+    updatedAt: z.ZodString;
+    parentBookId: z.ZodOptional<z.ZodString>;
+    fanficMode: z.ZodOptional<z.ZodEnum<["canon", "au", "ooc", "cp"]>>;
+}, "strip", z.ZodTypeAny, {
+    status: "incubating" | "outlining" | "active" | "paused" | "completed" | "dropped";
+    id: string;
+    title: string;
+    platform: "tomato" | "feilu" | "qidian" | "other";
+    genre: string;
+    targetChapters: number;
+    chapterWordCount: number;
+    createdAt: string;
+    updatedAt: string;
+    language?: "zh" | "en" | undefined;
+    parentBookId?: string | undefined;
+    fanficMode?: "canon" | "au" | "ooc" | "cp" | undefined;
+}, {
+    status: "incubating" | "outlining" | "active" | "paused" | "completed" | "dropped";
+    id: string;
+    title: string;
+    platform: "tomato" | "feilu" | "qidian" | "other";
+    genre: string;
+    createdAt: string;
+    updatedAt: string;
+    targetChapters?: number | undefined;
+    chapterWordCount?: number | undefined;
+    language?: "zh" | "en" | undefined;
+    parentBookId?: string | undefined;
+    fanficMode?: "canon" | "au" | "ooc" | "cp" | undefined;
+}>;
+export type BookConfig = z.infer<typeof BookConfigSchema>;
+//# sourceMappingURL=book.d.ts.map

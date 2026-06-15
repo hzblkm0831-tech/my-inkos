@@ -298,6 +298,13 @@ function wrapStreamRequiredError(
 
 // === Simple Chat (used by all agents via BaseAgent.chat()) ===
 
+export class QuotaExhaustedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "QuotaExhaustedError";
+  }
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function executeWithRetry<T>(
@@ -314,18 +321,36 @@ async function executeWithRetry<T>(
       const errorStr = String(error);
       const isRateLimit =
         errorStr.includes("429") ||
+        errorStr.includes("503") ||
+        errorStr.includes("502") ||
         errorStr.includes("Rate limit") ||
         errorStr.includes("quota") ||
         errorStr.includes("too many requests") ||
-        errorStr.includes("Quota exceeded");
+        errorStr.includes("Quota exceeded") ||
+        errorStr.includes("Stream interrupted") ||
+        error.name === "PartialResponseError" ||
+        error instanceof PartialResponseError;
 
-      if (isRateLimit && attempt < maxRetries) {
-        const delay = initialDelay * Math.pow(2, attempt - 1);
-        console.warn(
-          `[inkos] LLM 触发 429 限流或配额超限，将在 ${delay / 1000} 秒后重试 (尝试 ${attempt}/${maxRetries})...`,
-        );
-        await sleep(delay);
-        continue;
+      if (isRateLimit) {
+        if (attempt < maxRetries) {
+          const delay = initialDelay * Math.pow(2, attempt - 1);
+          console.warn(
+            `[inkos] LLM 触发限流或连接中断，将在 ${delay / 1000} 秒后重试 (尝试 ${attempt}/${maxRetries})...`,
+          );
+          await sleep(delay);
+          continue;
+        } else {
+          if (error instanceof PartialResponseError) {
+            console.warn(
+              `[inkos] LLM 达到最大重试次数，降级返回已截断的局部响应 (${error.partialContent.length} 字符)`,
+            );
+            return {
+              content: error.partialContent,
+              usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+            } as unknown as T;
+          }
+          throw new QuotaExhaustedError(`LLM Quota Exceeded / Connection failed after ${maxRetries} retries: ${errorStr}`);
+        }
       }
       throw error;
     }
@@ -344,7 +369,10 @@ export async function chatCompletion(
     readonly onTextDelta?: (text: string) => void;
   },
 ): Promise<LLMResponse> {
+  let attempt = 0;
   return executeWithRetry(async () => {
+    attempt++;
+    const useStream = client.stream && attempt === 1;
     const perCallMax = options?.maxTokens ?? client.defaults.maxTokens;
     const cap = client.defaults.maxTokensCap;
     const resolved = {
@@ -361,29 +389,21 @@ export async function chatCompletion(
 
     try {
       if (client.provider === "anthropic") {
-        return client.stream
+        return useStream
           ? await chatCompletionAnthropic(client._anthropic!, model, messages, resolved, client.defaults.thinkingBudget, onStreamProgress, onTextDelta)
           : await chatCompletionAnthropicSync(client._anthropic!, model, messages, resolved, client.defaults.thinkingBudget, onTextDelta);
       }
       if (client.apiFormat === "responses") {
-        return client.stream
+        return useStream
           ? await chatCompletionOpenAIResponses(client._openai!, model, messages, resolved, options?.webSearch, onStreamProgress, onTextDelta)
           : await chatCompletionOpenAIResponsesSync(client._openai!, model, messages, resolved, options?.webSearch, onTextDelta);
       }
-      return client.stream
+      return useStream
         ? await chatCompletionOpenAIChat(client._openai!, model, messages, resolved, options?.webSearch, onStreamProgress, onTextDelta)
         : await chatCompletionOpenAIChatSync(client._openai!, model, messages, resolved, options?.webSearch, onTextDelta);
     } catch (error) {
-      // Stream interrupted but partial content is usable — return truncated response
-      if (error instanceof PartialResponseError) {
-        return {
-          content: error.partialContent,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-        };
-      }
-
       // Auto-fallback: if streaming failed, retry with sync (many proxies don't support SSE)
-      if (client.stream) {
+      if (useStream && !(error instanceof PartialResponseError)) {
         const isStreamRelated = isLikelyStreamError(error);
         if (isStreamRelated) {
           try {
@@ -499,13 +519,18 @@ async function chatCompletionOpenAIChat(
   let outputTokens = 0;
   const monitor = createStreamMonitor(onStreamProgress);
 
+  let finishReasonReceived = false;
   try {
     for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta?.content;
+      const choice = chunk.choices[0];
+      const delta = choice?.delta?.content;
       if (delta) {
         chunks.push(delta);
         monitor.onChunk(delta);
         onTextDelta?.(delta);
+      }
+      if (choice?.finish_reason && choice.finish_reason !== "length") {
+        finishReasonReceived = true;
       }
       if (chunk.usage) {
         inputTokens = chunk.usage.prompt_tokens ?? 0;
@@ -525,6 +550,12 @@ async function chatCompletionOpenAIChat(
 
   const content = chunks.join("");
   if (!content) throw new Error("LLM returned empty response from stream");
+  if (!finishReasonReceived) {
+    throw new PartialResponseError(
+      content,
+      new Error("Stream connection closed prematurely or truncated (no valid stop reason)")
+    );
+  }
 
   return {
     content,
@@ -555,9 +586,17 @@ async function chatCompletionOpenAIChatSync(
   };
   const response = await client.chat.completions.create(syncParams);
 
-  const content = response.choices[0]?.message?.content ?? "";
+  const choice = response.choices[0];
+  const content = choice?.message?.content ?? "";
   if (!content) throw new Error("LLM returned empty response");
   onTextDelta?.(content);
+
+  if (choice?.finish_reason === "length") {
+    throw new PartialResponseError(
+      content,
+      new Error("Sync response truncated because it exceeded the maximum token limit (finish_reason = length)")
+    );
+  }
 
   return {
     content,
@@ -696,6 +735,7 @@ async function chatCompletionOpenAIResponses(
   let outputTokens = 0;
   const monitor = createStreamMonitor(onStreamProgress);
 
+  let completedReceived = false;
   try {
     for await (const event of stream) {
       if (event.type === "response.output_text.delta") {
@@ -704,6 +744,7 @@ async function chatCompletionOpenAIResponses(
         onTextDelta?.(event.delta);
       }
       if (event.type === "response.completed") {
+        completedReceived = true;
         inputTokens = event.response.usage?.input_tokens ?? 0;
         outputTokens = event.response.usage?.output_tokens ?? 0;
       }
@@ -721,6 +762,12 @@ async function chatCompletionOpenAIResponses(
 
   const content = chunks.join("");
   if (!content) throw new Error("LLM returned empty response from stream");
+  if (!completedReceived) {
+    throw new PartialResponseError(
+      content,
+      new Error("Stream connection closed prematurely before response.completed event")
+    );
+  }
 
   return {
     content,
@@ -895,6 +942,7 @@ async function chatCompletionAnthropic(
   let outputTokens = 0;
   const monitor = createStreamMonitor(onStreamProgress);
 
+  let completedReceived = false;
   try {
     for await (const event of stream) {
       if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
@@ -907,6 +955,9 @@ async function chatCompletionAnthropic(
       }
       if (event.type === "message_delta") {
         outputTokens = ((event as unknown as { usage?: { output_tokens?: number } }).usage?.output_tokens) ?? 0;
+      }
+      if (event.type === "message_stop") {
+        completedReceived = true;
       }
     }
   } catch (streamError) {
@@ -922,6 +973,12 @@ async function chatCompletionAnthropic(
 
   const content = chunks.join("");
   if (!content) throw new Error("LLM returned empty response from stream");
+  if (!completedReceived) {
+    throw new PartialResponseError(
+      content,
+      new Error("Stream connection closed prematurely before message_stop event")
+    );
+  }
 
   return {
     content,

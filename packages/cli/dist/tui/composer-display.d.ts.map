@@ -1,0 +1,1 @@
+{"version":3,"file":"composer-display.d.ts","sourceRoot":"","sources":["../../src/tui/composer-display.ts"],"names":[],"mappings":"AAAA,wBAAgB,qBAAqB,CACnC,UAAU,EAAE,MAAM,EAClB,WAAW,EAAE,MAAM,EACnB,UAAU,EAAE,OAAO,GAClB;IACD,QAAQ,CAAC,gBAAgB,EAAE,MAAM,CAAC;IAClC,QAAQ,CAAC,eAAe,EAAE,MAAM,CAAC;IACjC,QAAQ,CAAC,MAAM,EAAE,MAAM,CAAC;IACxB,QAAQ,CAAC,aAAa,EAAE,OAAO,CAAC;CACjC,CAgBA"}

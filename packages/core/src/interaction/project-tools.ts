@@ -13,7 +13,7 @@ import type {
 import { chatCompletion } from "../index.js";
 import { executeEditTransaction } from "./edit-controller.js";
 import type { InteractionRuntimeTools } from "./runtime.js";
-import type { BookCreationDraft } from "./session.js";
+import { BookCreationDraftSchema, type BookCreationDraft } from "./session.js";
 
 type PipelineLike = Pick<PipelineRunner, "writeNextChapter" | "reviseDraft"> & {
   readonly initBook?: (
@@ -121,6 +121,86 @@ function parseCreationDraftResult(text: string): {
   } catch {
     return null;
   }
+}
+
+function cleanDraftData(raw: any): any {
+  if (!raw || typeof raw !== "object") {
+    return { concept: "未命名想法" };
+  }
+
+  const cleaned: any = { ...raw };
+
+  // 1. Clean language
+  if (cleaned.language !== undefined) {
+    const langStr = String(cleaned.language).toLowerCase().trim();
+    if (langStr.includes("zh") || langStr.includes("中") || langStr.includes("cn")) {
+      cleaned.language = "zh";
+    } else if (langStr.includes("en") || langStr.includes("英") || langStr.includes("us") || langStr.includes("uk")) {
+      cleaned.language = "en";
+    } else {
+      delete cleaned.language;
+    }
+  }
+
+  // 2. Clean fields that should be string but might be parsed as object/array by LLMs
+  const stringFields = [
+    "concept", "title", "genre", "platform", "blurb", "worldPremise",
+    "settingNotes", "protagonist", "supportingCast", "conflictCore",
+    "volumeOutline", "constraints", "authorIntent", "currentFocus",
+    "nextQuestion"
+  ];
+
+  for (const field of stringFields) {
+    const val = cleaned[field];
+    if (val === undefined || val === null) {
+      continue;
+    }
+
+    if (Array.isArray(val)) {
+      cleaned[field] = val.map((item) => typeof item === "object" ? JSON.stringify(item) : String(item)).join("\n");
+    } else if (typeof val === "object") {
+      const lines: string[] = [];
+      for (const [k, v] of Object.entries(val)) {
+        lines.push(`${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`);
+      }
+      cleaned[field] = lines.join("\n");
+    } else {
+      cleaned[field] = String(val);
+    }
+
+    if (cleaned[field].trim().length === 0) {
+      delete cleaned[field];
+    }
+  }
+
+  // 3. Normalize numbers
+  const numberFields = ["targetChapters", "chapterWordCount"];
+  for (const field of numberFields) {
+    const val = cleaned[field];
+    if (val !== undefined && val !== null) {
+      const parsedInt = parseInt(String(val), 10);
+      if (!isNaN(parsedInt) && parsedInt > 0) {
+        cleaned[field] = parsedInt;
+      } else {
+        delete cleaned[field];
+      }
+    }
+  }
+
+  // 4. Ensure required fields are not empty strings (avoid Zod min(1) errors)
+  if (!cleaned.concept || typeof cleaned.concept !== "string" || cleaned.concept.trim().length === 0) {
+    cleaned.concept = "未命名想法";
+  }
+
+  // 5. Sanity checks on lists/booleans
+  if (cleaned.missingFields !== undefined && !Array.isArray(cleaned.missingFields)) {
+    delete cleaned.missingFields;
+  }
+  if (cleaned.readyToCreate !== undefined && typeof cleaned.readyToCreate !== "boolean") {
+    delete cleaned.readyToCreate;
+  }
+
+  return cleaned;
 }
 
 function deriveBookId(title: string): string {
@@ -516,7 +596,7 @@ export function createInteractionToolsFromDeps(
         __interaction: {
           responseText: parsed.assistantReply,
           details: {
-            creationDraft: parsed.draft,
+            creationDraft: BookCreationDraftSchema.parse(cleanDraftData(parsed.draft)),
           },
         },
       };

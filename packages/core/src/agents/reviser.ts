@@ -255,7 +255,7 @@ ${chapterContent}`;
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      { temperature: 0.3, maxTokens },
+      { temperature: 0.4, maxTokens },
     );
 
     const output = this.parseOutput(response.content, gp, mode, chapterContent);

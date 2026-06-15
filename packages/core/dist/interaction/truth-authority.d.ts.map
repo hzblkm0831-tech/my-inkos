@@ -1,0 +1,1 @@
+{"version":3,"file":"truth-authority.d.ts","sourceRoot":"","sources":["../../src/interaction/truth-authority.ts"],"names":[],"mappings":"AAAA,MAAM,MAAM,cAAc,GACtB,WAAW,GACX,YAAY,GACZ,OAAO,GACP,eAAe,GACf,QAAQ,CAAC;AAab,wBAAgB,sBAAsB,CAAC,QAAQ,EAAE,MAAM,GAAG,MAAM,CAO/D;AAED,wBAAgB,sBAAsB,CAAC,QAAQ,EAAE,MAAM,GAAG,cAAc,CAiBvE"}

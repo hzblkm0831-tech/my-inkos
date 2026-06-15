@@ -1,0 +1,1 @@
+{"version":3,"file":"modes.d.ts","sourceRoot":"","sources":["../../src/interaction/modes.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,CAAC,EAAE,MAAM,KAAK,CAAC;AAExB,eAAO,MAAM,oBAAoB,uCAAqC,CAAC;AAEvE,MAAM,MAAM,cAAc,GAAG,CAAC,CAAC,KAAK,CAAC,OAAO,oBAAoB,CAAC,CAAC;AAElE,wBAAgB,uBAAuB,CACrC,IAAI,EAAE,MAAM,GAAG,SAAS,EACxB,QAAQ,GAAE,cAAuB,GAChC,cAAc,CAGhB"}

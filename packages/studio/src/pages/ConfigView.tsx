@@ -11,6 +11,13 @@ const ROUTING_AGENTS = [
   "architect",
   "radar",
   "chapter-analyzer",
+  "planner",
+  "composer",
+  "foundation-reviewer",
+  "fanfic-canon-importer",
+  "length-normalizer",
+  "state-validator",
+  "consolidator",
 ] as const;
 
 interface AgentOverride {

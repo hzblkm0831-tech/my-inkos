@@ -1,0 +1,1 @@
+{"version":3,"file":"chat-draft.d.ts","sourceRoot":"","sources":["../../src/tui/chat-draft.ts"],"names":[],"mappings":"AAAA,OAAO,EAEL,KAAK,kBAAkB,EACxB,MAAM,oBAAoB,CAAC;AAE5B,wBAAgB,kCAAkC,CAChD,OAAO,EAAE,kBAAkB,EAC3B,KAAK,EAAE,MAAM,EACb,SAAS,GAAE,MAAmB,GAC7B,kBAAkB,CAMpB;AAED,wBAAgB,6BAA6B,CAC3C,OAAO,EAAE,kBAAkB,EAC3B,KAAK,EAAE,MAAM,EACb,SAAS,GAAE,MAAmB,GAC7B,kBAAkB,CAoBpB"}

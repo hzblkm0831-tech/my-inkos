@@ -1,0 +1,1 @@
+{"version":3,"file":"composer-caret.js","sourceRoot":"","sources":["../../src/tui/composer-caret.ts"],"names":[],"mappings":"AAKA,MAAM,UAAU,yBAAyB,CAAC,MAIzC;IACC,IAAI,MAAM,CAAC,YAAY,EAAE,CAAC;QACxB,OAAO;YACL,OAAO,EAAE,KAAK;YACd,aAAa,EAAE,KAAK;SACrB,CAAC;IACJ,CAAC;IAED,OAAO;QACL,OAAO,EAAE,IAAI;QACb,aAAa,EAAE,KAAK;KACrB,CAAC;AACJ,CAAC"}

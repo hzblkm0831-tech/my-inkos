@@ -1,0 +1,602 @@
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { chatCompletion } from "../index.js";
+import { executeEditTransaction } from "./edit-controller.js";
+import { BookCreationDraftSchema } from "./session.js";
+function normalizePlatform(platform) {
+    switch (platform) {
+        case "tomato":
+        case "feilu":
+        case "qidian":
+            return platform;
+        default:
+            return "other";
+    }
+}
+function extractBalancedJsonObject(text) {
+    const start = text.indexOf("{");
+    if (start < 0) {
+        return null;
+    }
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+        const char = text[index];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (char === "\\") {
+                escaped = true;
+                continue;
+            }
+            if (char === "\"") {
+                inString = false;
+            }
+            continue;
+        }
+        if (char === "\"") {
+            inString = true;
+            continue;
+        }
+        if (char === "{") {
+            depth += 1;
+            continue;
+        }
+        if (char === "}") {
+            depth -= 1;
+            if (depth === 0) {
+                return text.slice(start, index + 1);
+            }
+            if (depth < 0) {
+                return null;
+            }
+        }
+    }
+    return null;
+}
+function parseCreationDraftResult(text) {
+    const candidate = extractBalancedJsonObject(text);
+    if (!candidate) {
+        return null;
+    }
+    try {
+        const parsed = JSON.parse(candidate);
+        if (!parsed.assistantReply || !parsed.draft) {
+            return null;
+        }
+        return {
+            assistantReply: parsed.assistantReply,
+            draft: parsed.draft,
+        };
+    }
+    catch {
+        return null;
+    }
+}
+function cleanDraftData(raw) {
+    if (!raw || typeof raw !== "object") {
+        return { concept: "未命名想法" };
+    }
+    const cleaned = { ...raw };
+    // 1. Clean language
+    if (cleaned.language !== undefined) {
+        const langStr = String(cleaned.language).toLowerCase().trim();
+        if (langStr.includes("zh") || langStr.includes("中") || langStr.includes("cn")) {
+            cleaned.language = "zh";
+        }
+        else if (langStr.includes("en") || langStr.includes("英") || langStr.includes("us") || langStr.includes("uk")) {
+            cleaned.language = "en";
+        }
+        else {
+            delete cleaned.language;
+        }
+    }
+    // 2. Clean fields that should be string but might be parsed as object/array by LLMs
+    const stringFields = [
+        "concept", "title", "genre", "platform", "blurb", "worldPremise",
+        "settingNotes", "protagonist", "supportingCast", "conflictCore",
+        "volumeOutline", "constraints", "authorIntent", "currentFocus",
+        "nextQuestion"
+    ];
+    for (const field of stringFields) {
+        const val = cleaned[field];
+        if (val === undefined || val === null) {
+            continue;
+        }
+        if (Array.isArray(val)) {
+            cleaned[field] = val.map((item) => typeof item === "object" ? JSON.stringify(item) : String(item)).join("\n");
+        }
+        else if (typeof val === "object") {
+            const lines = [];
+            for (const [k, v] of Object.entries(val)) {
+                lines.push(`${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`);
+            }
+            cleaned[field] = lines.join("\n");
+        }
+        else {
+            cleaned[field] = String(val);
+        }
+        if (cleaned[field].trim().length === 0) {
+            delete cleaned[field];
+        }
+    }
+    // 3. Normalize numbers
+    const numberFields = ["targetChapters", "chapterWordCount"];
+    for (const field of numberFields) {
+        const val = cleaned[field];
+        if (val !== undefined && val !== null) {
+            const parsedInt = parseInt(String(val), 10);
+            if (!isNaN(parsedInt) && parsedInt > 0) {
+                cleaned[field] = parsedInt;
+            }
+            else {
+                delete cleaned[field];
+            }
+        }
+    }
+    // 4. Ensure required fields are not empty strings (avoid Zod min(1) errors)
+    if (!cleaned.concept || typeof cleaned.concept !== "string" || cleaned.concept.trim().length === 0) {
+        cleaned.concept = "未命名想法";
+    }
+    // 5. Sanity checks on lists/booleans
+    if (cleaned.missingFields !== undefined && !Array.isArray(cleaned.missingFields)) {
+        delete cleaned.missingFields;
+    }
+    if (cleaned.readyToCreate !== undefined && typeof cleaned.readyToCreate !== "boolean") {
+        delete cleaned.readyToCreate;
+    }
+    return cleaned;
+}
+function deriveBookId(title) {
+    return title
+        .toLowerCase()
+        .replace(/[^a-z0-9\u4e00-\u9fff]/g, "-")
+        .replace(/-+/g, "-")
+        .slice(0, 30);
+}
+function buildBookConfig(input) {
+    const now = new Date().toISOString();
+    return {
+        id: deriveBookId(input.title),
+        title: input.title,
+        platform: normalizePlatform(input.platform),
+        genre: input.genre ?? "other",
+        status: "outlining",
+        targetChapters: input.targetChapters ?? 200,
+        chapterWordCount: input.chapterWordCount ?? 3000,
+        ...(input.language ? { language: input.language } : {}),
+        createdAt: now,
+        updatedAt: now,
+    };
+}
+function buildCreationExternalContext(input) {
+    const sections = [
+        input.worldPremise ? `## 世界观与核心设定\n${input.worldPremise}` : undefined,
+        input.settingNotes ? `## 补充设定\n${input.settingNotes}` : undefined,
+        input.protagonist ? `## 主角设定\n${input.protagonist}` : undefined,
+        input.supportingCast ? `## 关键角色与势力\n${input.supportingCast}` : undefined,
+        input.conflictCore ? `## 核心冲突\n${input.conflictCore}` : undefined,
+        input.volumeOutline ? `## 卷纲方向\n${input.volumeOutline}` : undefined,
+        input.blurb ? `## 简介卖点\n${input.blurb}` : undefined,
+        input.constraints ? `## 创作约束\n${input.constraints}` : undefined,
+    ].filter((section) => Boolean(section?.trim()));
+    if (sections.length === 0) {
+        return undefined;
+    }
+    return sections.join("\n\n");
+}
+export function buildChapterFileLookup(files) {
+    const lookup = new Map();
+    for (const file of files) {
+        if (!file.endsWith(".md") || !/^\d{4}/.test(file)) {
+            continue;
+        }
+        const chapterNumber = parseInt(file.slice(0, 4), 10);
+        if (!lookup.has(chapterNumber)) {
+            lookup.set(chapterNumber, file);
+        }
+    }
+    return lookup;
+}
+async function exportBookToPath(state, bookId, options) {
+    const format = options.format ?? "txt";
+    const index = await state.loadChapterIndex(bookId);
+    const book = await state.loadBookConfig(bookId);
+    const chapters = options.approvedOnly
+        ? index.filter((chapter) => chapter.status === "approved")
+        : index;
+    if (chapters.length === 0) {
+        throw new Error("No chapters to export.");
+    }
+    const bookDir = state.bookDir(bookId);
+    const chaptersDir = join(bookDir, "chapters");
+    const projectRoot = dirname(dirname(bookDir));
+    const outputPath = options.outputPath ?? join(projectRoot, `${bookId}_export.${format}`);
+    const chapterFiles = buildChapterFileLookup(await readdir(chaptersDir));
+    if (format === "epub") {
+        const sections = [
+            "<!DOCTYPE html>",
+            `<html><head><meta charset="utf-8"><title>${book.title}</title><style>body{font-family:serif;max-width:40em;margin:auto;padding:2em;line-height:1.8}h2{margin-top:3em}</style></head><body>`,
+            `<h1>${book.title}</h1>`,
+        ];
+        for (const chapter of chapters) {
+            const match = chapterFiles.get(chapter.number);
+            if (!match) {
+                continue;
+            }
+            const markdown = await readFile(join(chaptersDir, match), "utf-8");
+            const title = markdown.match(/^#\s+(.+)/m)?.[1] ?? match.replace(/\.md$/, "");
+            const htmlBody = markdown
+                .split("\n")
+                .filter((line) => !line.startsWith("#"))
+                .map((line) => line.trim() ? `<p>${line}</p>` : "")
+                .join("\n");
+            sections.push(`<h2>${title}</h2>`);
+            sections.push(htmlBody);
+        }
+        sections.push("</body></html>");
+        await mkdir(dirname(outputPath), { recursive: true });
+        await writeFile(outputPath, sections.join("\n"), "utf-8");
+    }
+    else {
+        const parts = [];
+        parts.push(format === "md" ? `# ${book.title}\n\n---\n` : `${book.title}\n\n`);
+        for (const chapter of chapters) {
+            const match = chapterFiles.get(chapter.number);
+            if (!match) {
+                continue;
+            }
+            parts.push(await readFile(join(chaptersDir, match), "utf-8"));
+            parts.push("\n\n");
+        }
+        await mkdir(dirname(outputPath), { recursive: true });
+        await writeFile(outputPath, parts.join(format === "md" ? "\n---\n\n" : "\n"), "utf-8");
+    }
+    return {
+        outputPath,
+        chaptersExported: chapters.length,
+        totalWords: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
+        format,
+    };
+}
+function mapStageMessageToStatus(message) {
+    const lower = message.trim().toLowerCase();
+    if (lower.includes("planning next chapter")
+        || lower.includes("generating foundation")
+        || lower.includes("reviewing foundation")
+        || lower.includes("preparing chapter inputs")
+        || message.includes("规划下一章意图")
+        || message.includes("生成基础设定")
+        || message.includes("审核基础设定")
+        || message.includes("准备章节输入")) {
+        return "planning";
+    }
+    if (lower.includes("composing chapter runtime context")
+        || message.includes("组装章节运行时上下文")) {
+        return "composing";
+    }
+    if (lower.includes("writing chapter draft")
+        || message.includes("撰写章节草稿")) {
+        return "writing";
+    }
+    if (lower.includes("auditing draft")
+        || message.includes("审计草稿")) {
+        return "assessing";
+    }
+    if (lower.includes("fixing")
+        || lower.includes("revising chapter")
+        || lower.includes("rewrite")
+        || lower.includes("repair")
+        || message.includes("自动修复")
+        || message.includes("整章改写")
+        || message.includes("修订第")) {
+        return "repairing";
+    }
+    if (lower.includes("persist")
+        || lower.includes("saving")
+        || lower.includes("snapshot")
+        || lower.includes("rebuilding final truth files")
+        || lower.includes("validating truth file updates")
+        || lower.includes("syncing memory indexes")
+        || message.includes("落盘")
+        || message.includes("保存")
+        || message.includes("快照")
+        || message.includes("校验真相文件变更")
+        || message.includes("生成最终真相文件")
+        || message.includes("同步记忆索引")) {
+        return "persisting";
+    }
+    return undefined;
+}
+function extractStageDetail(message) {
+    if (message.startsWith("Stage: ")) {
+        return message.slice("Stage: ".length).trim();
+    }
+    if (message.startsWith("阶段：")) {
+        return message.slice("阶段：".length).trim();
+    }
+    return undefined;
+}
+function createInteractionLogger(original, events, bookId) {
+    const emit = (level, message) => {
+        const stageDetail = extractStageDetail(message);
+        const stageStatus = stageDetail ? mapStageMessageToStatus(stageDetail) : undefined;
+        if (stageDetail && stageStatus) {
+            events.push({
+                kind: "stage.changed",
+                timestamp: Date.now(),
+                status: stageStatus,
+                bookId,
+                detail: stageDetail,
+            });
+            return;
+        }
+        if (level === "warn") {
+            events.push({
+                kind: "task.warning",
+                timestamp: Date.now(),
+                status: "blocked",
+                bookId,
+                detail: message,
+            });
+            return;
+        }
+        if (level === "error") {
+            events.push({
+                kind: "task.failed",
+                timestamp: Date.now(),
+                status: "failed",
+                bookId,
+                detail: message,
+            });
+        }
+    };
+    const wrap = (base) => ({
+        debug: (msg, ctx) => {
+            emit("debug", msg);
+            base?.debug(msg, ctx);
+        },
+        info: (msg, ctx) => {
+            emit("info", msg);
+            base?.info(msg, ctx);
+        },
+        warn: (msg, ctx) => {
+            emit("warn", msg);
+            base?.warn(msg, ctx);
+        },
+        error: (msg, ctx) => {
+            emit("error", msg);
+            base?.error(msg, ctx);
+        },
+        child: (tag, extraCtx) => wrap(base?.child(tag, extraCtx)),
+    });
+    return wrap(original);
+}
+async function withPipelineInteractionTelemetry(pipeline, bookId, executor) {
+    const events = [];
+    const originalLogger = pipeline.config?.logger;
+    if (pipeline.config) {
+        pipeline.config.logger = createInteractionLogger(originalLogger, events, bookId);
+    }
+    try {
+        const result = await executor();
+        return {
+            ...result,
+            __interaction: {
+                events,
+                ...(typeof result.chapterNumber === "number"
+                    ? { activeChapterNumber: result.chapterNumber }
+                    : {}),
+            },
+        };
+    }
+    finally {
+        if (pipeline.config) {
+            pipeline.config.logger = originalLogger;
+        }
+    }
+}
+export function createInteractionToolsFromDeps(pipeline, state, hooks) {
+    const instrumentedPipeline = pipeline;
+    return {
+        listBooks: () => state.listBooks(),
+        developBookDraft: async (input, existingDraft) => {
+            if (!instrumentedPipeline.config?.client || !instrumentedPipeline.config?.model) {
+                const concept = existingDraft?.concept ?? input;
+                return {
+                    __interaction: {
+                        responseText: "先把这本书的大概方向收住。你更想写长篇连载，还是十来章能收住的版本？",
+                        details: {
+                            creationDraft: {
+                                concept,
+                                title: existingDraft?.title,
+                                genre: existingDraft?.genre,
+                                platform: existingDraft?.platform,
+                                language: existingDraft?.language,
+                                targetChapters: existingDraft?.targetChapters,
+                                chapterWordCount: existingDraft?.chapterWordCount,
+                                blurb: existingDraft?.blurb,
+                                authorIntent: existingDraft?.authorIntent,
+                                currentFocus: existingDraft?.currentFocus,
+                                nextQuestion: "你更想写长篇连载，还是十来章能收住的版本？",
+                                missingFields: existingDraft?.missingFields ?? ["title", "genre", "targetChapters"],
+                                readyToCreate: existingDraft?.readyToCreate ?? false,
+                            },
+                        },
+                    },
+                };
+            }
+            const response = await chatCompletion(instrumentedPipeline.config.client, instrumentedPipeline.config.model, [
+                {
+                    role: "system",
+                    content: [
+                        "You are InkOS book ideation assistant.",
+                        "Turn the user's latest message and the current draft into a tighter book creation draft.",
+                        "Ask at most one sharp next question.",
+                        "Default to concise Chinese unless the draft language is clearly English.",
+                        "Return JSON only with keys assistantReply and draft.",
+                        "draft must include concept and may include title, genre, platform, language, targetChapters, chapterWordCount, blurb, worldPremise, settingNotes, protagonist, supportingCast, conflictCore, volumeOutline, constraints, authorIntent, currentFocus, nextQuestion, missingFields, readyToCreate.",
+                        "Help the user decide and revise worldview, setting, protagonist, supporting cast, core conflict, blurb, and volume direction.",
+                        "Be conservative: only mark readyToCreate=true when the draft already has a workable title, genre, targetChapters, chapterWordCount, and enough setting/conflict detail to generate a foundation.",
+                    ].join(" "),
+                },
+                {
+                    role: "user",
+                    content: JSON.stringify({
+                        currentDraft: existingDraft ?? null,
+                        latestMessage: input,
+                    }, null, 2),
+                },
+            ], { temperature: 0.4 });
+            const parsed = parseCreationDraftResult(response.content);
+            if (!parsed) {
+                throw new Error("Book draft assistant returned invalid JSON.");
+            }
+            return {
+                __interaction: {
+                    responseText: parsed.assistantReply,
+                    details: {
+                        creationDraft: BookCreationDraftSchema.parse(cleanDraftData(parsed.draft)),
+                    },
+                },
+            };
+        },
+        createBook: async (input) => {
+            const book = buildBookConfig(input);
+            if (!pipeline.initBook) {
+                throw new Error("Pipeline does not support shared book creation.");
+            }
+            await pipeline.initBook(book, {
+                externalContext: buildCreationExternalContext(input),
+                authorIntent: input.authorIntent,
+                currentFocus: input.currentFocus,
+            });
+            return {
+                bookId: book.id,
+                title: book.title,
+                __interaction: {
+                    responseText: `Created ${book.title} (${book.id}).`,
+                    details: {
+                        bookId: book.id,
+                        title: book.title,
+                    },
+                },
+            };
+        },
+        exportBook: async (bookId, options) => {
+            const result = await exportBookToPath(state, bookId, options);
+            return {
+                ...result,
+                __interaction: {
+                    responseText: `Exported ${bookId} to ${result.outputPath} (${result.chaptersExported} chapters).`,
+                    details: {
+                        outputPath: result.outputPath,
+                        chaptersExported: result.chaptersExported,
+                        totalWords: result.totalWords,
+                        format: result.format,
+                    },
+                },
+            };
+        },
+        chat: async (input, options) => {
+            const bookLabel = options.bookId ?? "none";
+            const chatRequestOptions = hooks?.getChatRequestOptions?.() ?? {};
+            let response;
+            if (instrumentedPipeline.config?.client && instrumentedPipeline.config?.model) {
+                try {
+                    response = await chatCompletion(instrumentedPipeline.config.client, instrumentedPipeline.config.model, [
+                        {
+                            role: "system",
+                            content: [
+                                "You are InkOS inside the terminal workbench.",
+                                "Respond conversationally and briefly.",
+                                "If there is no active book, help the user decide what to write next.",
+                                "If there is an active book, keep the answer grounded in that book context.",
+                            ].join(" "),
+                        },
+                        {
+                            role: "user",
+                            content: `activeBook=${bookLabel}\nautomationMode=${options.automationMode}\nmessage=${input}`,
+                        },
+                    ], {
+                        temperature: chatRequestOptions.temperature ?? 0.4,
+                        ...(chatRequestOptions.maxTokens !== undefined && { maxTokens: chatRequestOptions.maxTokens }),
+                        onTextDelta: hooks?.onChatTextDelta,
+                    });
+                }
+                catch (err) {
+                    // Thinking models (e.g. kimi-k2.5) may return empty content for simple inputs.
+                    // Only swallow empty-content errors; re-throw everything else (network, auth, etc.)
+                    const msg = err instanceof Error ? err.message : "";
+                    if (!msg.includes("empty") && !msg.includes("content")) {
+                        throw err;
+                    }
+                }
+            }
+            return {
+                __interaction: {
+                    responseText: response?.content?.trim()
+                        || (options.bookId
+                            ? `I’m here. Active book is ${options.bookId}.`
+                            : "I’m here. No active book yet."),
+                },
+            };
+        },
+        writeNextChapter: (bookId) => withPipelineInteractionTelemetry(instrumentedPipeline, bookId, () => pipeline.writeNextChapter(bookId)),
+        reviseDraft: (bookId, chapterNumber, mode) => withPipelineInteractionTelemetry(instrumentedPipeline, bookId, () => pipeline.reviseDraft(bookId, chapterNumber, mode)),
+        patchChapterText: async (bookId, chapterNumber, targetText, replacementText) => {
+            const execution = await executeEditTransaction({
+                bookDir: (targetBookId) => state.bookDir(targetBookId),
+                loadChapterIndex: (targetBookId) => state.loadChapterIndex(targetBookId),
+                saveChapterIndex: (targetBookId, index) => state.saveChapterIndex(targetBookId, index),
+            }, {
+                kind: "chapter-local-edit",
+                bookId,
+                chapterNumber,
+                instruction: `Replace ${targetText} with ${replacementText}`,
+                targetText,
+                replacementText,
+            });
+            return {
+                __interaction: {
+                    activeChapterNumber: chapterNumber,
+                    responseText: execution.summary,
+                },
+            };
+        },
+        renameEntity: async (bookId, oldValue, newValue) => {
+            const execution = await executeEditTransaction({
+                bookDir: (targetBookId) => state.bookDir(targetBookId),
+                loadChapterIndex: (targetBookId) => state.loadChapterIndex(targetBookId),
+                saveChapterIndex: (targetBookId, index) => state.saveChapterIndex(targetBookId, index),
+            }, {
+                kind: "entity-rename",
+                bookId,
+                entityType: "character",
+                oldValue,
+                newValue,
+            });
+            return {
+                __interaction: {
+                    responseText: execution.summary,
+                },
+            };
+        },
+        updateCurrentFocus: async (bookId, content) => {
+            await state.ensureControlDocuments(bookId);
+            await writeFile(join(state.bookDir(bookId), "story", "current_focus.md"), content, "utf-8");
+        },
+        updateAuthorIntent: async (bookId, content) => {
+            await state.ensureControlDocuments(bookId);
+            await writeFile(join(state.bookDir(bookId), "story", "author_intent.md"), content, "utf-8");
+        },
+        writeTruthFile: async (bookId, fileName, content) => {
+            await state.ensureControlDocuments(bookId);
+            await writeFile(join(state.bookDir(bookId), "story", fileName), content, "utf-8");
+        },
+    };
+}
+//# sourceMappingURL=project-tools.js.map

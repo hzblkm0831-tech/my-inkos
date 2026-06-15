@@ -422,7 +422,7 @@ export function BookCreate({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunc
                   </div>
                 ) : null}
 
-                {draft.missingFields.length > 0 ? (
+                {draft.missingFields && draft.missingFields.length > 0 ? (
                   <div className="space-y-2">
                     <div className="text-xs font-medium text-foreground">{copy.missingHeading}</div>
                     <div className="flex flex-wrap gap-2">

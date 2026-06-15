@@ -105,13 +105,17 @@ Core blurb principle:
 - 必须有噱头（如"凡是被写在笔记本上的名字，最后都得死"）`;
 
     const volumeOutlinePrompt = resolvedLanguage === "en"
-      ? `Volume plan. For each volume include: title, chapter range, core conflict, key turning points, and payoff goal
+      ? `Volume plan. **【IMPORTANT: STRICT CONTROLS ON LENGTH】Due to API output token limits, keep descriptions extremely concise. Detail ONLY the first volume (around Chapters 1-30). For all subsequent volumes, write ONLY one single sentence summarizing the direction. Avoid long paragraphs.**
+
+For each volume include: title, chapter range, core conflict, key turning points, and payoff goal
 
 ### Golden First Three Chapters Rule
 - Chapter 1: throw the core conflict immediately; no large background dump
 - Chapter 2: show the core edge / ability / leverage that answers Chapter 1's pressure
 - Chapter 3: establish the first concrete short-term goal that gives readers a reason to continue`
-      : `卷纲规划，每卷包含：卷名、章节范围、核心冲突、关键转折、收益目标
+      : `卷纲规划。**【重要：严格控制篇幅】由于大模型最大输出Token限制，请务必精炼文字。你只需要详细规划第一卷（Chapters 1-30左右），其余所有后续卷次只能各用一行极其简短的一句话概述方向，严禁长篇大论。**
+
+每卷包含：卷名、章节范围、核心冲突、关键转折、收益目标
 
 ### 黄金三章法则（前三章必须遵循）
 - 第1章：抛出核心冲突（主角立即面临困境/危机/选择），禁止大段背景灌输
@@ -267,7 +271,14 @@ ${currentStatePrompt}
 === SECTION: pending_hooks ===
 ${pendingHooksPrompt}
 
-${finalRequirementsPrompt}`;
+${finalRequirementsPrompt}
+
+【极度危险：API字数截断警告】受限于严格的底层 API 额度，你的单次输出总长度**绝对不能超过 2000 字**！
+- 你必须极其压缩篇幅！不要使用任何长篇大论的修饰词，直接列出骨干干货。
+- \`story_bible\` 和 \`book_rules\` 必须精简至极。
+- \`volume_outline\` 只允许写第一卷前 30 章的极简大纲，后续卷次严禁展开，全部合并成一句 20 字以内的话。
+- 如果你的总输出过长，最后的内容将被物理切断导致系统严重崩溃！
+【CRITICAL: OUTPUT LENGTH CONTROL】You are severely constrained by a strict API token limit! Your TOTAL output must NOT exceed 2000 characters. Compress everything into extreme bullet points. If you write too much, the output will be physically truncated causing system failure. Ensure the final === SECTION: pending_hooks === is printed fully!`;
 
     const langPrefix = resolvedLanguage === "en"
       ? `【LANGUAGE OVERRIDE】ALL output (story_bible, volume_outline, book_rules, current_state, pending_hooks) MUST be written in English. Character names, place names, and all prose must be in English. The === SECTION: === tags remain unchanged.\n\n`
@@ -279,7 +290,7 @@ ${finalRequirementsPrompt}`;
     const response = await this.chat([
       { role: "system", content: langPrefix + systemPrompt },
       { role: "user", content: userMessage },
-    ], { maxTokens: 16384, temperature: 0.8 });
+    ], { maxTokens: 16384, temperature: 0.2 });
 
     return this.parseSections(response.content);
   }
@@ -676,7 +687,7 @@ ${keyPrinciplesPrompt}`;
         role: "user",
         content: userMessage,
       },
-    ], { maxTokens: 16384, temperature: 0.5 });
+    ], { maxTokens: 16384, temperature: 0.2 });
 
     return this.parseSections(response.content);
   }
@@ -765,7 +776,7 @@ prohibitions:
         role: "user",
         content: `请为标题为"${book.title}"的${fanficMode}模式同人小说生成基础设定。目标${book.targetChapters}章，每章${book.chapterWordCount}字。`,
       },
-    ], { maxTokens: 16384, temperature: 0.7 });
+    ], { maxTokens: 16384, temperature: 0.2 });
 
     return this.parseSections(response.content);
   }
@@ -807,7 +818,8 @@ ${trimmed}\n`;
     const extract = (name: string): string => {
       const section = parsedSections.get(this.normalizeSectionName(name));
       if (!section) {
-        throw new Error(`Architect output missing required section: ${name}`);
+        const found = Array.from(parsedSections.keys()).join(", ");
+        throw new Error(`Architect output missing required section: ${name}. Found sections: [${found}]`);
       }
       if (name !== "pending_hooks") {
         return section;
@@ -829,6 +841,7 @@ ${trimmed}\n`;
       .normalize("NFKC")
       .toLowerCase()
       .replace(/[`"'*_]/g, " ")
+      .replace(/\.md$/i, "")
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "");
   }
