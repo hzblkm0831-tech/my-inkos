@@ -650,7 +650,7 @@ ${chapterContent}`;
       { role: "system" as const, content: systemPrompt },
       { role: "user" as const, content: userPrompt },
     ];
-    const chatOptions = { temperature: options?.temperature ?? 0.3 };
+    const chatOptions = { temperature: options?.temperature ?? 0.1 };
 
     // Use web search for fact verification when eraResearch is enabled
     const response = gp.eraResearch

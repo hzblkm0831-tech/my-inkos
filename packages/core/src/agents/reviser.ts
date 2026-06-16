@@ -281,7 +281,7 @@ ${chapterContent}`;
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      { temperature: 0.3 },
+      { temperature: 0.4 },
     );
 
     const output = this.parseOutput(

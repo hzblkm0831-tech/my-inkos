@@ -108,6 +108,13 @@ export class ArchitectAgent extends BaseAgent {
     return "architect";
   }
 
+  private readonly LIMIT_WARNING_PROMPT = `\n\n【极度危险：API字数截断警告】受限于严格的底层 API 额度，你的单次输出总长度**绝对不能超过 2500 字**！
+- 你必须极其压缩篇幅！不要使用任何冗长累赘的修饰词，直接列出最核心的精炼散文骨干。
+- \\\`story_frame\\\`、\\\`roles\\\` 和 \\\`book_rules\\\` 必须极致精简。
+- \\\`volume_map\\\` 只允许写前几卷的极简散文规划，字数控制在数百字内，严禁长篇大论。
+- 如果你的总输出过长，最后的内容将被物理切断，导致系统严重解析失败！
+【CRITICAL: OUTPUT LENGTH CONTROL】You are severely constrained by a strict API token limit! Your TOTAL output must NOT exceed 2500 characters. Compress everything into extreme, punchy prose. If you write too much, the output will be physically truncated causing system failure. Ensure the final === SECTION: pending_hooks === is printed fully!`;
+
   async generateFoundation(
     book: BookConfig,
     externalContext?: string,
@@ -152,7 +159,7 @@ export class ArchitectAgent extends BaseAgent {
       : `请为标题为"${book.title}"的${gp.name}小说生成完整基础设定。`;
 
     const response = await this.chat([
-      { role: "system", content: langPrefix + systemPrompt + revisePrompt },
+      { role: "system", content: langPrefix + systemPrompt + revisePrompt + this.LIMIT_WARNING_PROMPT },
       { role: "user", content: userMessage },
     ], { temperature: 0.8 });
 
@@ -1088,7 +1095,7 @@ ${continuationDirective}
       : `以下是《${book.title}》的已有正文资料包，请从中反向推导完整基础设定：\n\n${chaptersText}`;
 
     const response = await this.chat([
-      { role: "system", content: systemPrompt },
+      { role: "system", content: systemPrompt + this.LIMIT_WARNING_PROMPT },
       { role: "user", content: userMessage },
     ], { temperature: 0.5 });
 
@@ -1142,7 +1149,7 @@ ${genreBody}
 - 所有 outline 必须是散文密度`;
 
     const response = await this.chat([
-      { role: "system", content: systemPrompt },
+      { role: "system", content: systemPrompt + this.LIMIT_WARNING_PROMPT },
       {
         role: "user",
         content: `请为标题为"${book.title}"的${fanficMode}模式同人小说生成基础设定。目标${book.targetChapters}章，每章${book.chapterWordCount}字。`,

@@ -590,22 +590,36 @@ async function withTransientLLMRetry<T>(
 ): Promise<T> {
   const enabled = options?.enabled ?? true;
   let lastError: unknown;
-  for (let attempt = 0; attempt <= TRANSIENT_LLM_RETRIES; attempt++) {
+  const maxRetries = 5;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await run();
-    } catch (error) {
+    } catch (error: any) {
       lastError = error;
+      const errorStr = String(error);
+      const isRateLimitOrStreamInterrupt =
+        isRetryableLLMError(error) ||
+        errorStr.includes("429") ||
+        errorStr.includes("503") ||
+        errorStr.includes("502") ||
+        errorStr.includes("504") ||
+        errorStr.includes("Quota exceeded") ||
+        errorStr.includes("Stream interrupted") ||
+        error instanceof PartialResponseError ||
+        error?.name === "PartialResponseError";
+
       if (
         !enabled
-        || attempt >= TRANSIENT_LLM_RETRIES
-        || error instanceof PartialResponseError
-        || !isRetryableLLMError(error)
+        || attempt >= maxRetries
+        || !isRateLimitOrStreamInterrupt
       ) {
         throw error;
       }
-      // Back off before retrying — immediate re-fire on a 429/503 just makes it
-      // worse. Linear is enough for a 2-retry budget (~0.8s, ~1.6s).
-      await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+      const delay = 4000 * Math.pow(2, attempt);
+      console.warn(
+        `[inkos] LLM 触发限流、50x 错误或流中断，将在 ${delay / 1000} 秒后重试 (尝试 ${attempt + 1}/${maxRetries})...`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
   throw lastError;
@@ -1150,23 +1164,29 @@ export async function chatCompletion(
   const onTextDelta = options?.onTextDelta;
   const errorCtx = { baseUrl: client._piModel?.baseUrl ?? "(unknown)", model, service: client.service };
 
+  let attempt = 0;
   try {
     return await withTransientLLMRetry(
       async () => {
+        attempt++;
+        // If this is a retry attempt (attempt > 1) and stream is enabled, downgrade to sync to bypass proxy issues
+        const currentClient = (attempt > 1 && client.stream)
+          ? { ...client, stream: false }
+          : client;
+
         assertWithinContextWindow({
-          piModel: resolvePiModel(client, model),
+          piModel: resolvePiModel(currentClient, model),
           model,
           estimatedInputTokens: estimateLLMMessagesTokens(messages),
           reservedOutputTokens: resolved.maxTokens,
         });
-        if (shouldUseNativeCustomTransport(client)) {
-          return chatCompletionViaCustomOpenAICompatible(client, model, messages, resolved, onStreamProgress, onTextDelta);
+        if (shouldUseNativeCustomTransport(currentClient)) {
+          return chatCompletionViaCustomOpenAICompatible(currentClient, model, messages, resolved, onStreamProgress, onTextDelta);
         }
-        return chatCompletionViaPiAi(client, model, messages, resolved, onStreamProgress, onTextDelta);
+        return chatCompletionViaPiAi(currentClient, model, messages, resolved, onStreamProgress, onTextDelta);
       },
-      // Retrying after UI text deltas have been emitted can duplicate visible
-      // text; callers can also opt out (e.g. fast-fail diagnostics).
-      { enabled: (options?.retry ?? true) && !onTextDelta },
+      // Allow retry even with onTextDelta to ensure book creation and writing do not crash on proxy transient failures
+      { enabled: options?.retry ?? true },
     );
   } catch (error) {
     // Stream interrupted but partial content is usable — return truncated response
