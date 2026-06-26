@@ -32,7 +32,11 @@ import {
   createPlayStartTool,
   createPlayStepTool,
   createProposeActionTool,
+  createScriptCreationTool,
+  createStoryboardCreationTool,
+  createInteractiveFilmCreationTool,
 } from "./agent-tools.js";
+import { createFilmAuthoringTools, filmLLMDepsFromClient } from "./film-authoring-tools.js";
 import { createBookContextTransform } from "./context-transform.js";
 import {
   appendTranscriptEvents,
@@ -50,6 +54,7 @@ import type { ActionPayload, ActionSource, RequestedIntent } from "../interactio
 import type { ContextCompressionCallback } from "../models/context-compression.js";
 import { assertSafeBookId } from "../utils/book-id.js";
 import { PlayStore } from "../play/play-store.js";
+import { isLlmStubEnabled, stubAgentStream } from "./llm-stub.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -247,6 +252,9 @@ function isTerminalProductionToolName(toolName: unknown): boolean {
   return toolName === "propose_action"
     || toolName === "sub_agent"
     || toolName === "short_fiction_run"
+    || toolName === "script_create"
+    || toolName === "storyboard_create"
+    || toolName === "interactive_film_create"
     || toolName === "generate_cover"
     || toolName === "play_start"
     || toolName === "play_edit"
@@ -660,6 +668,44 @@ function createAgentToolsForMode(params: {
     return [proposalTool];
   }
 
+  if (params.sessionKind === "script") {
+    if (isConfirmed("script_create")) {
+      return [createScriptCreationTool(params.pipeline, params.projectRoot, { actionPayload: params.actionPayload })];
+    }
+    return [proposalTool];
+  }
+
+  if (params.sessionKind === "storyboard") {
+    if (isConfirmed("storyboard_create")) {
+      return [createStoryboardCreationTool(params.pipeline, params.projectRoot, { actionPayload: params.actionPayload })];
+    }
+    return [proposalTool];
+  }
+
+  if (params.sessionKind === "interactive-film") {
+    if (isConfirmed("interactive_film_create")) {
+      return [createInteractiveFilmCreationTool(params.pipeline, params.projectRoot, { actionPayload: params.actionPayload })];
+    }
+    return [proposalTool];
+  }
+
+  if (params.sessionKind === "interactive-film-authoring") {
+    const projectId = params.bookId;
+    if (!projectId) {
+      throw new Error("interactive-film-authoring session requires a non-null bookId");
+    }
+    const agentCtx = params.pipeline.createAgentContext("film-authoring", projectId);
+    const llm = filmLLMDepsFromClient(agentCtx.client, agentCtx.model);
+    return createFilmAuthoringTools({
+      projectRoot: params.projectRoot,
+      projectId,
+      llm,
+      proposeActionTool: proposalTool,
+      confirmedIntent: params.requestedIntent,
+    });
+  }
+
+
   if (params.sessionKind === "play") {
     if (isConfirmed("play_start")) {
       return [createPlayStartTool(params.pipeline, params.projectRoot, params.sessionId, params.playMode, { actionPayload: params.actionPayload })];
@@ -849,6 +895,7 @@ async function runAgentSessionUnlocked(
           terminalToolResultTail = false;
           return localAssistantStopStream(streamModel);
         }
+        if (isLlmStubEnabled()) return stubAgentStream(streamModel, context);
         return guardedStreamSimple(streamModel, context, options);
       },
       getApiKey: (provider: string) => {

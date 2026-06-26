@@ -1,7 +1,7 @@
 {
   "name": "@actalk/inkos-studio",
   "version": "1.5.0",
-  "description": "InkOS Studio — Web workbench for novel writing",
+  "description": "InkOS Studio — web workbench for story creation, InkOS Short, covers, and open-world interactive play",
   "type": "module",
   "main": "dist/api/index.js",
   "types": "dist/api/index.d.ts",
@@ -27,6 +27,7 @@
     "build:server": "tsc -p tsconfig.server.json",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
   },
   "dependencies": {
@@ -39,6 +40,7 @@
     "@streamdown/code": "^1.1.1",
     "@streamdown/math": "^1.0.2",
     "@streamdown/mermaid": "^1.0.2",
+    "@xyflow/react": "^12.11.1",
     "ai": "^6.0.159",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -57,6 +59,7 @@
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",

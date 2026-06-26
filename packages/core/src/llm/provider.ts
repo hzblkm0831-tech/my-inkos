@@ -14,6 +14,7 @@ import { getEndpoint } from "./providers/index.js";
 import { lookupModel } from "./providers/lookup.js";
 import { fetchWithProxy } from "../utils/proxy-fetch.js";
 import { isApiKeyOptionalForEndpoint } from "../utils/llm-endpoint-auth.js";
+import { isLlmStubEnabled, stubChatCompletion } from "../agent/llm-stub.js";
 
 
 // === Streaming Monitor Types ===
@@ -252,7 +253,10 @@ function parseEnvHeaders(): Record<string, string> | undefined {
   return undefined;
 }
 
-// === Partial Response (stream interrupted but usable content received) ===
+// === Partial Response（流式生成中途被掐断）===
+// 语义：内容不完整、不可信。由 withTransientLLMRetry 整体重新生成；
+// 重试耗尽后如实抛错。绝不把半截内容当成功返回（那会产出写到一半就
+// 结束的章节/设定文件）。partialContent 仅用于错误诊断。
 
 export class PartialResponseError extends Error {
   readonly partialContent: string;
@@ -262,9 +266,6 @@ export class PartialResponseError extends Error {
     this.partialContent = partialContent;
   }
 }
-
-/** Minimum chars to consider a partial response salvageable (Chinese ~2 chars/word → 500 chars ≈ 250 words) */
-const MIN_SALVAGEABLE_CHARS = 500;
 
 export class ContextWindowExceededError extends Error {
   readonly estimatedInputTokens: number;
@@ -581,7 +582,11 @@ export function isTransientLLMHttpError(error: unknown): boolean {
 }
 
 function isRetryableLLMError(error: unknown): boolean {
-  return isTransientLLMTransportError(error) || isTransientLLMHttpError(error);
+  // PartialResponseError = 流在生成中途被掐断（网关切长连接等）。重试会完整
+  // 重新生成一次，比把半截内容当成功交付（截断的章节/设定文件）要正确。
+  return error instanceof PartialResponseError
+    || isTransientLLMTransportError(error)
+    || isTransientLLMHttpError(error);
 }
 
 async function withTransientLLMRetry<T>(
@@ -611,7 +616,7 @@ async function withTransientLLMRetry<T>(
       if (
         !enabled
         || attempt >= maxRetries
-        || !isRateLimitOrStreamInterrupt
+        || !isRetryableLLMError(error)
       ) {
         throw error;
       }
@@ -887,6 +892,7 @@ async function chatCompletionViaCustomAnthropicCompatible(
   let buffer = "";
   let content = "";
   let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let sawMessageStop = false;
   const monitor = createStreamMonitor(onStreamProgress);
 
   try {
@@ -911,6 +917,7 @@ async function chatCompletionViaCustomAnthropicCompatible(
           usage.completionTokens = json.usage.output_tokens ?? usage.completionTokens;
         }
         if (json.type === "message_stop") {
+          sawMessageStop = true;
           usage.totalTokens = usage.promptTokens + usage.completionTokens;
         }
       }
@@ -921,6 +928,10 @@ async function chatCompletionViaCustomAnthropicCompatible(
 
   if (!content) {
     throw wrapLLMError(new Error("LLM returned empty response from stream"), errorCtx);
+  }
+  if (!sawMessageStop) {
+    // Anthropic 协议的正常结束必须有 message_stop；没有就是流被中途掐断
+    throw new PartialResponseError(content, new Error("stream closed without message_stop"));
   }
   if (!usage.totalTokens) {
     usage.totalTokens = usage.promptTokens + usage.completionTokens;
@@ -989,6 +1000,7 @@ async function chatCompletionViaCustomOpenAICompatible(
     let buffer = "";
     let content = "";
     let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let sawResponseTerminal = false;
     const monitor = createStreamMonitor(onStreamProgress);
 
     try {
@@ -1006,7 +1018,8 @@ async function chatCompletionViaCustomOpenAICompatible(
             monitor.onChunk(json.delta);
             onTextDelta?.(json.delta);
           }
-          if (json.type === "response.completed") {
+          if (json.type === "response.completed" || json.type === "response.incomplete") {
+            sawResponseTerminal = true;
             usage = {
               promptTokens: json.response?.usage?.input_tokens ?? 0,
               completionTokens: json.response?.usage?.output_tokens ?? 0,
@@ -1024,6 +1037,10 @@ async function chatCompletionViaCustomOpenAICompatible(
 
     if (!content) {
       throw wrapLLMError(new Error("LLM returned empty response from stream"), errorCtx);
+    }
+    if (!sawResponseTerminal) {
+      // Responses 协议的正常结束必须有 response.completed/incomplete 终止事件
+      throw new PartialResponseError(content, new Error("stream closed without response.completed"));
     }
     return { content, usage };
   }
@@ -1089,6 +1106,9 @@ async function chatCompletionViaCustomOpenAICompatible(
   let content = "";
   let reasoningContent = "";
   let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  // OpenAI 协议的正常结束必须出现 [DONE] 哨兵或带 finish_reason 的 chunk。
+  // 网关掐断长连接时流会"干净地"关闭但没有任何终止信号——那是截断，不是完成。
+  let sawTerminal = false;
   const monitor = createStreamMonitor(onStreamProgress);
 
   try {
@@ -1099,8 +1119,15 @@ async function chatCompletionViaCustomOpenAICompatible(
       const parsed = parseSseEvents(buffer);
       buffer = parsed.rest;
       for (const event of parsed.events) {
-        if (!event.data || event.data === "[DONE]") continue;
+        if (!event.data) continue;
+        if (event.data === "[DONE]") {
+          sawTerminal = true;
+          continue;
+        }
         const json = JSON.parse(event.data);
+        if (json?.choices?.[0]?.finish_reason) {
+          sawTerminal = true;
+        }
         const delta = extractChatDeltaContent(json);
         if (delta) {
           content += delta;
@@ -1130,6 +1157,9 @@ async function chatCompletionViaCustomOpenAICompatible(
   if (!finalContent) {
     throw wrapLLMError(new Error("LLM returned empty response from stream"), errorCtx);
   }
+  if (!sawTerminal) {
+    throw new PartialResponseError(finalContent, new Error("stream closed without [DONE]/finish_reason"));
+  }
   return { content: finalContent, usage };
 }
 
@@ -1150,6 +1180,7 @@ export async function chatCompletion(
     readonly retry?: boolean;
   },
 ): Promise<LLMResponse> {
+  if (isLlmStubEnabled()) return Promise.resolve(stubChatCompletion(messages, model));
   // C1 (v2.0.0)：删除 maxTokensCap 机制。per-call 显式传的 maxTokens 永远不被裁剪。
   const resolved = {
     temperature: clampTemperatureForModel(
@@ -1189,13 +1220,9 @@ export async function chatCompletion(
       { enabled: options?.retry ?? true },
     );
   } catch (error) {
-    // Stream interrupted but partial content is usable — return truncated response
-    if (error instanceof PartialResponseError) {
-      return {
-        content: error.partialContent,
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-      };
-    }
+    // 注意：中断的流（PartialResponseError）不再"打捞"半截内容当成功返回——
+    // 那会产出写到一半就结束的章节/设定文件。重试由 withTransientLLMRetry
+    // 负责（完整重新生成）；重试耗尽后如实抛错。
     throw wrapLLMError(error, errorCtx);
   }
 }
@@ -1285,6 +1312,7 @@ async function chatCompletionViaPiAi(
   const monitor = createStreamMonitor(onStreamProgress);
   let inputTokens = 0;
   let outputTokens = 0;
+  let sawDone = false;
 
   try {
     for await (const event of eventStream) {
@@ -1297,9 +1325,12 @@ async function chatCompletionViaPiAi(
         const msg = event.type === "done" ? event.message : event.error;
         inputTokens = msg.usage.input;
         outputTokens = msg.usage.output;
+        if (event.type === "done") {
+          sawDone = true;
+        }
         if (event.type === "error" && msg.errorMessage) {
           const partial = chunks.join("");
-          if (partial.length >= MIN_SALVAGEABLE_CHARS) {
+          if (partial) {
             throw new PartialResponseError(partial, new Error(msg.errorMessage));
           }
           throw new Error(msg.errorMessage);
@@ -1310,7 +1341,8 @@ async function chatCompletionViaPiAi(
     monitor.stop();
     if (streamError instanceof PartialResponseError) throw streamError;
     const partial = chunks.join("");
-    if (partial.length >= MIN_SALVAGEABLE_CHARS) {
+    if (partial) {
+      // 带着已收到的部分内容抛 PartialResponseError，让瞬时重试整体重新生成
       throw new PartialResponseError(partial, streamError);
     }
     throw streamError;
@@ -1323,6 +1355,10 @@ async function chatCompletionViaPiAi(
     const diag = `usage=${inputTokens}+${outputTokens}`;
     console.warn(`[inkos] LLM 流式响应无文本内容 (${diag})`);
     throw new Error(`LLM returned empty response from stream (${diag})`);
+  }
+  if (!sawDone) {
+    // 事件流没有以 done 收尾就结束 = 上游把流掐断了，内容不可信
+    throw new PartialResponseError(content, new Error("stream ended without done event"));
   }
 
   return {

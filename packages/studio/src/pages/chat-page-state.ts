@@ -112,6 +112,9 @@ export function pickProjectChatSessionId(
     || session.sessionKind === "chat"
     || session.sessionKind === "short"
     || session.sessionKind === "play"
+    || session.sessionKind === "script"
+    || session.sessionKind === "storyboard"
+    || session.sessionKind === "interactive-film"
   );
   return projectSurfaceSessions.find((session) => session.messageCount > 0)?.sessionId
     ?? projectSurfaceSessions[0]?.sessionId
@@ -139,4 +142,8 @@ export function isChatScrollNearBottom(input: {
   const threshold = input.thresholdPx ?? 96;
   const distanceFromBottom = input.scrollHeight - input.scrollTop - input.clientHeight;
   return distanceFromBottom <= threshold;
+}
+
+export function getChatScrollBehavior(isStreaming: boolean): "auto" | "smooth" {
+  return isStreaming ? "auto" : "smooth";
 }

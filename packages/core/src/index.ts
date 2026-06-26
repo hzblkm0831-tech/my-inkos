@@ -177,9 +177,13 @@ export {
   ActionPayloadSchema,
   CreateBookActionPayloadSchema,
   GenerateCoverActionPayloadSchema,
+  InteractiveFilmCreateActionPayloadSchema,
   PlayStartActionPayloadSchema,
   RequestedIntentSchema,
+  ScriptCreateActionPayloadSchema,
+  ScriptTargetFormatSchema,
   ShortRunActionPayloadSchema,
+  StoryboardCreateActionPayloadSchema,
   type ActionSource,
   type ActionPayload,
   type RequestedIntent,
@@ -445,6 +449,8 @@ export { analyzeHookHealth } from "./utils/hook-health.js";
 export { PipelineRunner, type PipelineConfig, type ChapterPipelineResult, type DraftResult, type PlanChapterResult, type ComposeChapterResult, type ReviseResult, type TruthFiles, type BookStatusInfo, type ImportChaptersInput, type ImportChaptersResult, type TokenUsageSummary } from "./pipeline/runner.js";
 export { Scheduler, type SchedulerConfig } from "./pipeline/scheduler.js";
 export { detectChapter, detectAndRewrite, loadDetectionHistory, type DetectChapterResult, type DetectAndRewriteResult } from "./pipeline/detection-runner.js";
+export { runScriptCreation, runStoryboardCreation, runInteractiveFilmCreation, createStoryboardAssetsManifest, type ScriptCreationRunOptions, type ScriptCreationRunResult, type StoryboardAssetsManifest, type StoryboardCreationRunOptions, type StoryboardCreationRunResult, type InteractiveFilmCreationRunOptions, type InteractiveFilmCreationRunResult, type StoryboardImageAsset, type StoryboardImageAssetVariant } from "./pipeline/script-storyboard-runner.js";
+export { ScriptCreationAgent, StoryboardCreationAgent, InteractiveFilmCreationAgent, renderScriptSpec, renderStoryboardSpec, renderInteractiveFilmSpec, type ScriptCreationInput, type ScriptTargetFormat, type StoryboardCreationInput, type InteractiveFilmCreationInput } from "./agents/script-storyboard.js";
 
 // State
 export { StateManager } from "./state/manager.js";
@@ -492,3 +498,86 @@ export async function sendWebhook(
   const transport = await import("./notify/webhook.js");
   await transport.sendWebhook(config, payload);
 }
+
+// ── Interactive Film (story graph) ──
+export {
+  StoryGraphSchema,
+  StoryNodeSchema,
+  ChoiceSchema,
+  VariableSchema,
+  EndingSchema,
+  ConditionSchema,
+  EffectSchema,
+  type StoryGraph,
+  type StoryNode,
+  type Choice,
+  type Variable,
+  type Ending,
+  type Condition,
+  type Effect,
+  type VarValue,
+  type NodeType,
+} from "./interactive-film/graph-schema.js";
+export {
+  evaluateCondition,
+  applyEffects,
+  visibleChoices,
+  initVarState,
+  type VarState,
+} from "./interactive-film/evaluator.js";
+export {
+  validateStoryGraph,
+  reviewStoryGraph,
+  type ValidationReport,
+  type ValidationIssue,
+} from "./interactive-film/validation.js";
+export {
+  loadStoryGraph,
+  saveStoryGraph,
+  storyGraphPath,
+} from "./interactive-film/graph-store.js";
+export {
+  generateStoryGraph,
+  buildStoryGraphFromLLMText,
+  extractJson,
+  type GenerateStoryGraphInput,
+} from "./interactive-film/generate.js";
+export {
+  WorldAnchorSchema,
+  CharacterSchema,
+  VoiceProfileSchema,
+  type WorldAnchor,
+  type Character,
+  type VoiceProfile,
+} from "./interactive-film/graph-schema.js";
+export {
+  StoryGraphDeltaSchema,
+  applyStoryGraphDelta,
+  type StoryGraphDelta,
+} from "./interactive-film/delta.js";
+export {
+  applyGraphDelta,
+  loadAuthoringState,
+  revertToSnapshot,
+  authoringStatePath,
+  type AuthoringState,
+} from "./interactive-film/authoring-store.js";
+export {
+  buildWorldAnchorDelta,
+  buildAddVariableDelta,
+  buildDefineEndingDelta,
+  buildRemoveNodeDelta,
+  buildConnectChoiceDelta,
+  buildUpsertCharactersDelta,
+} from "./interactive-film/authoring-tools.js";
+export { writeCharacterFacts, readCharacterVoices } from "./interactive-film/memory-link.js";
+export {
+  buildFillNodeDeltaFromLLMText,
+  buildStructureDeltaFromLLMText,
+} from "./interactive-film/authoring-generate.js";
+export { summarizeStoryGraph, buildFilmAuthoringContext } from "./interactive-film/film-context.js";
+export {
+  generateNodeImage,
+  defaultNodeImageDeps,
+  type NodeImageDeps,
+} from "./interactive-film/node-image.js";

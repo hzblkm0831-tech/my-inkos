@@ -19,6 +19,7 @@ import {
   mergeSessionIds,
   updateSession,
   upsertSessionSummary,
+  withToolExecutions,
 } from "./runtime";
 
 export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions> = (set, get) => ({
@@ -320,7 +321,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
     const trimmed = text.trim();
     const session = get().sessions[sessionId];
     if (!trimmed || !session || session.isStreaming) return;
-    const activeBookId = options?.activeBookId;
+    const activeBookId = options?.activeBookId ?? session.bookId ?? undefined;
     const sessionKind: ChatSessionKind = options?.sessionKind
       ?? session.sessionKind
       ?? (activeBookId ? "book" : "chat");
@@ -403,6 +404,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
 
       const finalContent = data.details?.draftRaw || data.response || "";
       const toolCall = data.details?.toolCall ?? undefined;
+      const responseToolExecutions = data.details?.toolExecutions ?? [];
       const responseBookId = data.session?.activeBookId ?? data.session?.bookId;
       const responseSessionKind = data.session?.sessionKind;
       if (responseBookId || responseSessionKind || data.session?.title || data.session?.playMode) {
@@ -430,6 +432,18 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       const hasStream = Boolean(
         get().sessions[sessionId]?.messages.some((message) => message.timestamp === streamTs),
       );
+      const attachResponseTools = () => {
+        if (responseToolExecutions.length === 0) return;
+        set((state) => ({
+          sessions: updateSession(state.sessions, sessionId, (runtime) => ({
+            messages: runtime.messages.map((message) => (
+              message.timestamp === streamTs && message.role === "assistant"
+                ? withToolExecutions(message, responseToolExecutions)
+                : message
+            )),
+          })),
+        }));
+      };
 
       if (data.error) {
         const errorMessage = extractErrorMessage(data.error);
@@ -441,18 +455,37 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       } else if (finalContent) {
         if (hasStream) {
           get().finalizeStream(sessionId, streamTs, finalContent, toolCall);
+          attachResponseTools();
         } else {
+          const message = withToolExecutions({
+            role: "assistant",
+            content: finalContent,
+            timestamp: Date.now(),
+            toolCall,
+          }, responseToolExecutions);
           set((state) => ({
             sessions: updateSession(state.sessions, sessionId, (runtime) => ({
               messages: [
                 ...runtime.messages,
-                {
-                  role: "assistant",
-                  content: finalContent,
-                  timestamp: Date.now(),
-                  toolCall,
-                },
+                message,
               ],
+            })),
+          }));
+        }
+      } else if (responseToolExecutions.length > 0) {
+        if (hasStream) {
+          get().finalizeStream(sessionId, streamTs, "", toolCall);
+          attachResponseTools();
+        } else {
+          const message = withToolExecutions({
+            role: "assistant",
+            content: "",
+            timestamp: Date.now(),
+            toolCall,
+          }, responseToolExecutions);
+          set((state) => ({
+            sessions: updateSession(state.sessions, sessionId, (runtime) => ({
+              messages: [...runtime.messages, message],
             })),
           }));
         }

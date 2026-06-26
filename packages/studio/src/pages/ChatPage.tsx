@@ -1,8 +1,9 @@
-import { useRef, useEffect, useMemo, useState } from "react";
+import { memo, useRef, useEffect, useMemo, useState } from "react";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
 import type { SSEMessage } from "../hooks/use-sse";
 import { fetchJson } from "../hooks/use-api";
+import type { MessagePart } from "../store/chat/types";
 import { chatSelectors, useChatStore } from "../store/chat";
 import type { ChatSessionKind } from "../store/chat";
 import { useServiceStore } from "../store/service";
@@ -20,6 +21,7 @@ import {
 import { ChatMessage } from "../components/chat/ChatMessage";
 import { QuickActions } from "../components/chat/QuickActions";
 import { ToolExecutionSteps, type ProposedActionDetails } from "../components/chat/ToolExecutionSteps";
+import { ProjectArtifactDrawer } from "../components/chat/ProjectArtifactDrawer";
 import { PlayHud } from "../components/chat/PlayHud";
 import { PlayChoicePanel } from "../components/chat/PlayChoicePanel";
 import { latestPlayChoiceSet } from "../components/chat/play-choices";
@@ -40,6 +42,7 @@ import {
 import {
   type ChatPageModelPreference,
   filterModelGroups,
+  getChatScrollBehavior,
   getBookCreateSessionId,
   getProjectChatSessionId,
   pickProjectChatSessionId,
@@ -58,11 +61,12 @@ interface Nav {
   toServices: () => void;
   toImport: (tab?: "chapters" | "canon" | "fanfic" | "spinoff" | "imitation") => void;
   toStyle: () => void;
+  toFilm: (projectId: string) => void;
 }
 
 export interface ChatPageProps {
   readonly activeBookId?: string;
-  readonly mode?: "book" | "book-create" | "project-chat";
+  readonly mode?: "book" | "book-create" | "project-chat" | "interactive-film-authoring";
   readonly nav: Nav;
   readonly theme: Theme;
   readonly t: TFunction;
@@ -90,6 +94,103 @@ interface CoverConfigResponse {
   readonly providers?: ReadonlyArray<{ readonly service: string; readonly connected?: boolean }>;
 }
 
+type ScrollFrameId = number | ReturnType<typeof setTimeout>;
+
+function requestScrollFrame(callback: () => void): ScrollFrameId {
+  if (typeof globalThis.requestAnimationFrame === "function") {
+    return globalThis.requestAnimationFrame(callback);
+  }
+  return globalThis.setTimeout(callback, 16);
+}
+
+function cancelScrollFrame(id: ScrollFrameId): void {
+  if (typeof id === "number" && typeof globalThis.cancelAnimationFrame === "function") {
+    globalThis.cancelAnimationFrame(id);
+    return;
+  }
+  globalThis.clearTimeout(id);
+}
+
+type AssistantRenderItem =
+  | { kind: "thinking"; pi: number; part: Extract<MessagePart, { type: "thinking" }> }
+  | { kind: "text"; pi: number; part: Extract<MessagePart, { type: "text" }> }
+  | { kind: "tools"; parts: Array<Extract<MessagePart, { type: "tool" }>>; startIdx: number };
+
+function groupAssistantParts(parts: ReadonlyArray<MessagePart>): AssistantRenderItem[] {
+  const items: AssistantRenderItem[] = [];
+  for (let pi = 0; pi < parts.length; pi += 1) {
+    const part = parts[pi];
+    if (part.type === "thinking") {
+      items.push({ kind: "thinking", pi, part });
+    } else if (part.type === "text") {
+      items.push({ kind: "text", pi, part });
+    } else if (part.type === "tool") {
+      const last = items[items.length - 1];
+      if (last?.kind === "tools") {
+        last.parts.push(part);
+      } else {
+        items.push({ kind: "tools", parts: [part], startIdx: pi });
+      }
+    }
+  }
+  return items;
+}
+
+const AssistantMessageParts = memo(function AssistantMessageParts({
+  parts,
+  timestamp,
+  theme,
+  onProposedAction,
+  onRejectProposedAction,
+}: {
+  readonly parts: ReadonlyArray<MessagePart>;
+  readonly timestamp: number;
+  readonly theme: Theme;
+  readonly onProposedAction?: (details: ProposedActionDetails) => void;
+  readonly onRejectProposedAction?: (details: ProposedActionDetails) => void;
+}) {
+  const items = useMemo(() => groupAssistantParts(parts), [parts]);
+
+  return (
+    <>
+      {items.map((item) => {
+        if (item.kind === "thinking") {
+          return (
+            <div key={`t-${item.pi}`} className="mb-2">
+              <Reasoning isStreaming={item.part.streaming}>
+                <ReasoningTrigger />
+                <ReasoningContent>{item.part.content}</ReasoningContent>
+              </Reasoning>
+            </div>
+          );
+        }
+        if (item.kind === "tools") {
+          return (
+            <ToolExecutionSteps
+              key={`x-${item.startIdx}`}
+              executions={item.parts.map((part) => part.execution)}
+              onProposedAction={onProposedAction}
+              onRejectProposedAction={onRejectProposedAction}
+            />
+          );
+        }
+        if (item.kind === "text" && item.part.content) {
+          return (
+            <ChatMessage
+              key={`c-${item.pi}`}
+              role="assistant"
+              content={item.part.content}
+              timestamp={timestamp}
+              theme={theme}
+            />
+          );
+        }
+        return null;
+      })}
+    </>
+  );
+});
+
 // -- Component --
 
 export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-create", nav, theme, t, sse: _sse }: ChatPageProps) {
@@ -113,13 +214,16 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
   const setSessionPlayMode = useChatStore((s) => s.setSessionPlayMode);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollFrameRef = useRef<ScrollFrameId | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const autoScrollPinnedRef = useRef(true);
 
   const isZh = t("nav.connected") === "\u5DF2\u8FDE\u63A5";
   const hasBook = Boolean(activeBookId);
   const currentSessionKind: ChatSessionKind = activeSession?.sessionKind
-    ?? (mode === "book-create" ? "book-create" : activeBookId ? "book" : "chat");
+    ?? (mode === "interactive-film-authoring" ? "interactive-film-authoring"
+      : mode === "book-create" ? "book-create"
+      : activeBookId ? "book" : "chat");
   const playMode = activeSession?.playMode;
   // A play session must pick its playstyle (点着玩 / 自由玩) before chatting.
   const needsPlayModeChoice = currentSessionKind === "play" && !playMode;
@@ -244,13 +348,32 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [input]);
 
-  // Auto-scroll only while the reader is already near the bottom. Play sessions
-  // update tool/image state frequently, so unconditional scrolling makes it
-  // impossible to read older turns.
+  // Auto-scroll only while the reader is already near the bottom. Streaming
+  // updates use instant scroll to avoid piling up smooth-scroll animations.
   useEffect(() => {
-    if (!scrollRef.current || !autoScrollPinnedRef.current) return;
-    scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+    const el = scrollRef.current;
+    if (!el) return undefined;
+    if (!autoScrollPinnedRef.current) return undefined;
+
+    if (scrollFrameRef.current !== null) {
+      cancelScrollFrame(scrollFrameRef.current);
+    }
+
+    scrollFrameRef.current = requestScrollFrame(() => {
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: getChatScrollBehavior(loading || isStreaming),
+      });
+      scrollFrameRef.current = null;
+    });
+
+    return () => {
+      if (scrollFrameRef.current !== null) {
+        cancelScrollFrame(scrollFrameRef.current);
+        scrollFrameRef.current = null;
+      }
+    };
+  }, [messages, loading, isStreaming]);
 
   useEffect(() => {
     autoScrollPinnedRef.current = true;
@@ -286,7 +409,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
           return;
         }
 
-        await createSession(activeBookId, "book");
+        await createSession(activeBookId, mode === "interactive-film-authoring" ? "interactive-film-authoring" : "book");
         return;
       }
 
@@ -566,6 +689,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
                               executions={item.parts.map(p => p.execution)}
                               onProposedAction={handleProposedAction}
                               onRejectProposedAction={handleRejectProposedAction}
+                              onOpenFilm={nav.toFilm}
                             />
                           );
                         }
@@ -774,6 +898,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
           sessionTitle={activeSession?.title ?? null}
         />
       )}
+      <ProjectArtifactDrawer />
     </div>
   );
 }

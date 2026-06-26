@@ -724,6 +724,19 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
+  it("returns a structured config error when inkos.json is corrupt", async () => {
+    await writeFile(join(root, "inkos.json"), "{ this is not valid json", "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/project");
+    expect(response.status).toBe(500);
+    const body = await response.json() as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("PROJECT_CONFIG_INVALID");
+    expect(body.error.message).toContain("inkos.json");
+  });
+
   it("reloads latest llm config for doctor checks without restarting the studio server", async () => {
     const startupConfig = {
       ...cloneProjectConfig(),
@@ -2183,6 +2196,41 @@ describe("createStudioServer daemon lifecycle", () => {
     expect([400, 404]).toContain(traversal.status);
   });
 
+  it("reads and writes generated text artifacts without exposing arbitrary files", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const artifactDir = join(root, "interactive-films", "demo");
+    await mkdir(artifactDir, { recursive: true });
+    await writeFile(join(artifactDir, "script.md"), "# 初稿\n\n第一幕", "utf-8");
+    await writeFile(join(artifactDir, "cover.png"), Buffer.from("not-text"));
+
+    const ok = await app.request("http://localhost/api/v1/project/artifacts/interactive-films/demo/script.md");
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("content-type")).toContain("application/json");
+    expect(await ok.json()).toMatchObject({
+      path: "interactive-films/demo/script.md",
+      content: "# 初稿\n\n第一幕",
+      contentType: "text/markdown; charset=utf-8",
+    });
+
+    const save = await app.request("http://localhost/api/v1/project/artifacts/interactive-films/demo/script.md", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "# 修订\n\n第二幕" }),
+    });
+    expect(save.status).toBe(200);
+    expect(await readFile(join(artifactDir, "script.md"), "utf-8")).toBe("# 修订\n\n第二幕");
+
+    const unsupported = await app.request("http://localhost/api/v1/project/artifacts/interactive-films/demo/cover.png");
+    expect(unsupported.status).toBe(415);
+
+    const unsupportedRoot = await app.request("http://localhost/api/v1/project/artifacts/books/demo/story_bible.md");
+    expect(unsupportedRoot.status).toBe(400);
+
+    const traversal = await app.request("http://localhost/api/v1/project/artifacts/interactive-films/%2e%2e/inkos.json");
+    expect([400, 404]).toContain(traversal.status);
+  });
+
   it("rejects create requests when a complete book with the same id already exists", async () => {
     await mkdir(join(root, "books", "existing-book", "story"), { recursive: true });
     await writeFile(join(root, "books", "existing-book", "book.json"), JSON.stringify({ id: "existing-book" }), "utf-8");
@@ -2699,7 +2747,16 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(response.status).toBe(200);
     expect(runAgentSessionMock).not.toHaveBeenCalled();
     await expect(response.json()).resolves.toMatchObject({
-      response: "暴雨敲着铁皮门，封存档案箱压在门口。",
+      response: "",
+      details: {
+        toolExecutions: [
+          expect.objectContaining({
+            tool: "play_start",
+            status: "completed",
+            result: "暴雨敲着铁皮门，封存档案箱压在门口。",
+          }),
+        ],
+      },
       session: { sessionId: "play-session-1", sessionKind: "play" },
     });
     expect(appendManualSessionMessagesMock).toHaveBeenCalledWith(
@@ -2774,8 +2831,9 @@ describe("createStudioServer daemon lifecycle", () => {
 
     const body = await response.json();
     expect(response.status, JSON.stringify(body)).toBe(200);
-    expect(body.response).toContain("主演栏写着赵铁生");
-    expect(body.response).not.toContain("主演栏里有个名字叫");
+    expect(body.response).toBe("");
+    expect(body.details?.toolExecutions?.[0]?.result).toContain("主演栏写着赵铁生");
+    expect(body.details?.toolExecutions?.[0]?.result).not.toContain("主演栏里有个名字叫");
     await expect(readFile(join(root, "worlds", "play-session-truncated", "runs", "main", "projections", "scene.md"), "utf-8"))
       .resolves.toContain("主演栏写着赵铁生");
   });
@@ -4072,6 +4130,80 @@ describe("createStudioServer daemon lifecycle", () => {
 
     const after = await app.request("http://localhost/api/v1/project/chapter-review-mode");
     await expect(after.json()).resolves.toMatchObject({ mode: "manual" });
+  });
+
+  it("stores chapter review mode per book without changing the project default", async () => {
+    await writeCompleteBookFixture(root, "demo-book", "Demo Book");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const saveBookMode = await app.request("http://localhost/api/v1/books/demo-book/chapter-review-mode", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "manual" }),
+    });
+    await expect(saveBookMode.json()).resolves.toMatchObject({
+      ok: true,
+      mode: "manual",
+      bookMode: "manual",
+      projectMode: "auto",
+    });
+
+    const bookMode = await app.request("http://localhost/api/v1/books/demo-book/chapter-review-mode");
+    await expect(bookMode.json()).resolves.toMatchObject({
+      mode: "manual",
+      bookMode: "manual",
+      projectMode: "auto",
+    });
+
+    const projectMode = await app.request("http://localhost/api/v1/project/chapter-review-mode");
+    await expect(projectMode.json()).resolves.toMatchObject({ mode: "auto" });
+    const rawBook = JSON.parse(await readFile(join(root, "books", "demo-book", "book.json"), "utf-8"));
+    expect(rawBook.writing.reviewMode).toBe("manual");
+  });
+
+  it("uses a book-level manual review override when writing the next chapter", async () => {
+    await writeCompleteBookFixture(root, "demo-book", "Demo Book");
+    const rawBookPath = join(root, "books", "demo-book", "book.json");
+    const rawBook = JSON.parse(await readFile(rawBookPath, "utf-8"));
+    await writeFile(rawBookPath, JSON.stringify({
+      ...rawBook,
+      writing: { reviewMode: "manual" },
+    }, null, 2), "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/write-next", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    expect(pipelineConfigs.at(-1)).toMatchObject({ chapterReviewMode: "manual" });
+  });
+
+  it("exposes a global default model endpoint backed by llm.defaultModel", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const initial = await app.request("http://localhost/api/v1/project/default-model");
+    await expect(initial.json()).resolves.toMatchObject({
+      defaultModel: "gpt-5.4",
+    });
+
+    const save = await app.request("http://localhost/api/v1/project/default-model", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ service: "kkaiapi", defaultModel: "deepseek-v4-flash" }),
+    });
+    await expect(save.json()).resolves.toMatchObject({
+      ok: true,
+      service: "kkaiapi",
+      defaultModel: "deepseek-v4-flash",
+    });
+
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.service).toBe("kkaiapi");
+    expect(raw.llm.defaultModel).toBe("deepseek-v4-flash");
+    expect(raw.llm.model).toBe("deepseek-v4-flash");
   });
 
   it("project advanced settings expose input governance and detection config", async () => {

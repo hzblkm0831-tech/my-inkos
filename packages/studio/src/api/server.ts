@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
+import { gzipSync } from "node:zlib";
 import {
   StateManager,
   PipelineRunner,
@@ -66,9 +67,22 @@ import {
   type ActionPayload,
   type ActionSource,
   createGenerateCoverTool,
+  createInteractiveFilmCreationTool,
   createPlayStartTool,
+  createScriptCreationTool,
   createShortFictionRunTool,
+  createStoryboardCreationTool,
   createSubAgentTool,
+  createDraftStructureTool,
+  createConnectChoiceTool,
+  createRemoveNodeTool,
+  filmLLMDepsFromClient,
+  applyGraphDelta,
+  loadStoryGraph,
+  reviewStoryGraph,
+  generateNodeImage,
+  defaultNodeImageDeps,
+  type NodeImageDeps,
   type ResolvedModel,
   type PipelineConfig,
   type PlayMode,
@@ -78,8 +92,8 @@ import {
   type RequestedIntent,
   type SessionKind,
 } from "@actalk/inkos-core";
-import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
 import { buildStudioBookConfig } from "./book-create.js";
@@ -111,6 +125,9 @@ const TOOL_LABELS: Record<string, string> = {
   read: "读取文件", edit: "编辑文件", grep: "搜索", ls: "列目录",
   propose_action: "确认动作",
   short_fiction_run: "短篇生产",
+  script_create: "剧本创作",
+  storyboard_create: "分镜创作",
+  interactive_film_create: "互动影游",
   generate_cover: "生成封面",
   play_edit: "编辑互动世界",
   play_start: "启动互动世界",
@@ -124,13 +141,13 @@ function resolveToolLabel(tool: string, agent?: string): string {
 }
 
 function summarizeResult(result: unknown): string {
-  if (typeof result === "string") return result.slice(0, 200);
+  if (typeof result === "string") return result.slice(0, 2000);
   if (result && typeof result === "object") {
     const r = result as Record<string, unknown>;
-    if (typeof r.content === "string") return r.content.slice(0, 200);
-    if (typeof r.text === "string") return r.text.slice(0, 200);
+    if (typeof r.content === "string") return r.content.slice(0, 2000);
+    if (typeof r.text === "string") return r.text.slice(0, 2000);
   }
-  return String(result).slice(0, 200);
+  return String(result).slice(0, 2000);
 }
 
 function compareServiceListItems(
@@ -144,6 +161,76 @@ function compareServiceListItems(
     return (leftPriority === -1 ? 999 : leftPriority) - (rightPriority === -1 ? 999 : rightPriority);
   }
   return 0;
+}
+
+async function buildTarArchive(sourceDir: string, packageRootName: string): Promise<Buffer> {
+  const files = await listArchiveFiles(sourceDir);
+  const chunks: Buffer[] = [];
+  for (const file of files) {
+    const payload = await readFile(join(sourceDir, file));
+    const archiveName = normalizeArchivePath(join(packageRootName, file));
+    chunks.push(createTarHeader(archiveName, payload.byteLength));
+    chunks.push(payload);
+    const padding = (512 - (payload.byteLength % 512)) % 512;
+    if (padding > 0) chunks.push(Buffer.alloc(padding));
+  }
+  chunks.push(Buffer.alloc(1024));
+  return Buffer.concat(chunks);
+}
+
+async function listArchiveFiles(dir: string, prefix = ""): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === ".DS_Store") continue;
+    const relativePath = prefix ? join(prefix, entry.name) : entry.name;
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await listArchiveFiles(fullPath, relativePath));
+    } else if (entry.isFile()) {
+      files.push(normalizeArchivePath(relativePath));
+    } else {
+      const info = await stat(fullPath).catch(() => null);
+      if (info?.isFile()) files.push(normalizeArchivePath(relativePath));
+    }
+  }
+  return files.sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeArchivePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\/+/g, "");
+}
+
+function createTarHeader(name: string, size: number): Buffer {
+  const header = Buffer.alloc(512, 0);
+  writeTarString(header, 0, 100, name);
+  writeTarOctal(header, 100, 8, 0o644);
+  writeTarOctal(header, 108, 8, 0);
+  writeTarOctal(header, 116, 8, 0);
+  writeTarOctal(header, 124, 12, size);
+  writeTarOctal(header, 136, 12, Math.floor(Date.now() / 1000));
+  header.fill(0x20, 148, 156);
+  header[156] = "0".charCodeAt(0);
+  writeTarString(header, 257, 6, "ustar");
+  writeTarString(header, 263, 2, "00");
+  let checksum = 0;
+  for (const byte of header) checksum += byte;
+  writeTarOctal(header, 148, 8, checksum);
+  return header;
+}
+
+function writeTarString(header: Buffer, offset: number, length: number, value: string): void {
+  const encoded = Buffer.from(value);
+  if (encoded.byteLength > length) {
+    throw new Error(`Archive path is too long for tar header: ${value}`);
+  }
+  encoded.copy(header, offset);
+}
+
+function writeTarOctal(header: Buffer, offset: number, length: number, value: number): void {
+  const text = value.toString(8).padStart(length - 1, "0").slice(-(length - 1));
+  header.write(text, offset, length - 1, "ascii");
+  header[offset + length - 1] = 0;
 }
 
 function isHeaderSafeApiKey(value: string): boolean {
@@ -228,8 +315,8 @@ function resolveProjectImageFile(root: string, rawPath: string): { readonly reso
   ) {
     throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Invalid project file path");
   }
-  if (!relPath.startsWith("shorts/") && !relPath.startsWith("covers/")) {
-    throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Only generated shorts/ and covers/ images can be previewed");
+  if (!relPath.startsWith("shorts/") && !relPath.startsWith("covers/") && !relPath.startsWith("interactive-films/")) {
+    throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Only generated shorts/, covers/, interactive-films/ images can be previewed");
   }
 
   const ext = relPath.split(".").pop()?.toLowerCase() ?? "";
@@ -250,6 +337,53 @@ function resolveProjectImageFile(root: string, rawPath: string): { readonly reso
     throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Invalid project file path");
   }
   return { resolved, contentType };
+}
+
+function normalizeProjectGeneratedPath(root: string, rawPath: string, code: string): { readonly relPath: string; readonly resolved: string } {
+  let relPath: string;
+  try {
+    relPath = decodeURIComponent(rawPath).replace(/^\/+/u, "");
+  } catch {
+    throw new ApiError(400, code, "Invalid project artifact path");
+  }
+
+  if (
+    !relPath
+    || relPath.includes("\0")
+    || isAbsolute(relPath)
+    || relPath.split(/[\\/]+/u).includes("..")
+  ) {
+    throw new ApiError(400, code, "Invalid project artifact path");
+  }
+
+  const allowedRoots = ["dramas/", "storyboards/", "interactive-films/", "shorts/", "covers/"];
+  if (!allowedRoots.some((prefix) => relPath.startsWith(prefix))) {
+    throw new ApiError(400, code, "Only generated writing artifacts can be opened");
+  }
+
+  const resolved = resolve(root, relPath);
+  const rel = relative(root, resolved);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new ApiError(400, code, "Invalid project artifact path");
+  }
+
+  return { relPath, resolved };
+}
+
+function resolveProjectTextArtifactFile(root: string, rawPath: string): { readonly relPath: string; readonly resolved: string; readonly contentType: string } {
+  const file = normalizeProjectGeneratedPath(root, rawPath, "INVALID_PROJECT_ARTIFACT_PATH");
+  const ext = file.relPath.split(".").pop()?.toLowerCase() ?? "";
+  const contentTypes: Record<string, string> = {
+    md: "text/markdown; charset=utf-8",
+    markdown: "text/markdown; charset=utf-8",
+    txt: "text/plain; charset=utf-8",
+    json: "application/json; charset=utf-8",
+  };
+  const contentType = contentTypes[ext];
+  if (!contentType) {
+    throw new ApiError(415, "UNSUPPORTED_PROJECT_ARTIFACT_TYPE", "Unsupported project artifact type");
+  }
+  return { ...file, contentType };
 }
 
 function isLikelyFailedToolResult(exec: CollectedToolExec): boolean {
@@ -653,7 +787,12 @@ class ConfirmedActionExecutionError extends Error {
 }
 
 function suppressManualTextForTool(exec: CollectedToolExec): boolean {
-  return exec.tool === "play_start" || exec.tool === "play_step" || exec.tool === "play_revise";
+  return exec.tool === "play_start"
+    || exec.tool === "play_step"
+    || exec.tool === "play_revise"
+    || exec.tool === "script_create"
+    || exec.tool === "storyboard_create"
+    || exec.tool === "interactive_film_create";
 }
 
 function manualToolAssistantMessage(
@@ -698,9 +837,15 @@ function isConfirmedProductionAction(args: {
   return (args.actionSource === "button" || args.actionSource === "slash")
     && (
       args.requestedIntent === "create_book"
-      || args.requestedIntent === "short_run"
-      || args.requestedIntent === "play_start"
-      || args.requestedIntent === "generate_cover"
+    || args.requestedIntent === "short_run"
+    || args.requestedIntent === "script_create"
+    || args.requestedIntent === "storyboard_create"
+    || args.requestedIntent === "interactive_film_create"
+    || args.requestedIntent === "play_start"
+    || args.requestedIntent === "generate_cover"
+    || args.requestedIntent === "draft_structure"
+    || args.requestedIntent === "connect_choice"
+    || args.requestedIntent === "remove_node"
     );
 }
 
@@ -721,6 +866,7 @@ async function executeConfirmedProductionAction(args: {
   readonly pipeline: PipelineRunner;
   readonly root: string;
   readonly sessionId: string;
+  readonly bookId: string | null;
   readonly streamSessionId: string;
   readonly instruction: string;
   readonly requestedIntent: RequestedIntent;
@@ -732,7 +878,13 @@ async function executeConfirmedProductionAction(args: {
   let tool: ReturnType<typeof createSubAgentTool>
     | ReturnType<typeof createShortFictionRunTool>
     | ReturnType<typeof createGenerateCoverTool>
-    | ReturnType<typeof createPlayStartTool>;
+    | ReturnType<typeof createScriptCreationTool>
+    | ReturnType<typeof createStoryboardCreationTool>
+    | ReturnType<typeof createInteractiveFilmCreationTool>
+    | ReturnType<typeof createPlayStartTool>
+    | ReturnType<typeof createDraftStructureTool>
+    | ReturnType<typeof createConnectChoiceTool>
+    | ReturnType<typeof createRemoveNodeTool>;
   let params: Record<string, unknown>;
   let agent: string | undefined;
 
@@ -775,6 +927,60 @@ async function executeConfirmedProductionAction(args: {
       ...(payload?.coverPrompt ? { coverPrompt: payload.coverPrompt } : {}),
       ...(payload?.outputDir ? { outputDir: payload.outputDir } : {}),
     };
+  } else if (args.requestedIntent === "script_create") {
+    const payload = actionPayload?.scriptCreate;
+    const title = requirePayloadText(payload?.title, "确认创建剧本缺少标题，请重新生成确认卡。");
+    tool = createScriptCreationTool(args.pipeline, args.root, { actionPayload });
+    params = {
+      title,
+      instruction: args.instruction,
+      ...(payload?.sourceKind ? { sourceKind: payload.sourceKind } : {}),
+      ...(payload?.targetFormat ? { targetFormat: payload.targetFormat } : {}),
+      ...(payload?.sourceText ? { sourceText: payload.sourceText } : {}),
+      ...(payload?.sourcePath ? { sourcePath: payload.sourcePath } : {}),
+      ...(payload?.requirements ? { requirements: payload.requirements } : {}),
+      ...(payload?.episodeCount ? { episodeCount: payload.episodeCount } : {}),
+      ...(payload?.episodeDuration ? { episodeDuration: payload.episodeDuration } : {}),
+      ...(payload?.projectId ? { projectId: payload.projectId } : {}),
+      ...(payload?.outDir ? { outDir: payload.outDir } : {}),
+    };
+  } else if (args.requestedIntent === "storyboard_create") {
+    const payload = actionPayload?.storyboardCreate;
+    const title = requirePayloadText(payload?.title, "确认创建分镜缺少标题，请重新生成确认卡。");
+    tool = createStoryboardCreationTool(args.pipeline, args.root, { actionPayload });
+    params = {
+      title,
+      instruction: args.instruction,
+      ...(payload?.sourceKind ? { sourceKind: payload.sourceKind } : {}),
+      ...(payload?.sourceText ? { sourceText: payload.sourceText } : {}),
+      ...(payload?.sourcePath ? { sourcePath: payload.sourcePath } : {}),
+      ...(payload?.requirements ? { requirements: payload.requirements } : {}),
+      ...(payload?.visualStyle ? { visualStyle: payload.visualStyle } : {}),
+      ...(payload?.aspectRatio ? { aspectRatio: payload.aspectRatio } : {}),
+      ...(payload?.granularity ? { granularity: payload.granularity } : {}),
+      ...(payload?.maxShots ? { maxShots: payload.maxShots } : {}),
+      ...(payload?.projectId ? { projectId: payload.projectId } : {}),
+      ...(payload?.outDir ? { outDir: payload.outDir } : {}),
+    };
+  } else if (args.requestedIntent === "interactive_film_create") {
+    const payload = actionPayload?.interactiveFilmCreate;
+    const title = requirePayloadText(payload?.title, "确认创建互动影游缺少标题，请重新生成确认卡。");
+    tool = createInteractiveFilmCreationTool(args.pipeline, args.root, { actionPayload });
+    params = {
+      title,
+      instruction: args.instruction,
+      ...(payload?.sourceKind ? { sourceKind: payload.sourceKind } : {}),
+      ...(payload?.sourceText ? { sourceText: payload.sourceText } : {}),
+      ...(payload?.sourcePath ? { sourcePath: payload.sourcePath } : {}),
+      ...(payload?.requirements ? { requirements: payload.requirements } : {}),
+      ...(payload?.targetAudience ? { targetAudience: payload.targetAudience } : {}),
+      ...(payload?.episodeCount ? { episodeCount: payload.episodeCount } : {}),
+      ...(payload?.episodeDuration ? { episodeDuration: payload.episodeDuration } : {}),
+      ...(payload?.budget ? { budget: payload.budget } : {}),
+      ...(payload?.referenceMode ? { referenceMode: payload.referenceMode } : {}),
+      ...(payload?.projectId ? { projectId: payload.projectId } : {}),
+      ...(payload?.outDir ? { outDir: payload.outDir } : {}),
+    };
   } else if (args.requestedIntent === "play_start") {
     const payload = actionPayload?.playStart;
     const title = requirePayloadText(payload?.title, "确认启动互动世界缺少标题，请重新生成确认卡。");
@@ -801,6 +1007,38 @@ async function executeConfirmedProductionAction(args: {
       ...(payload?.mode ? { mode: payload.mode } : {}),
       ...(initialScene ? { initialScene } : {}),
       ...(payload?.suggestedActions ? { suggestedActions: payload.suggestedActions } : {}),
+    };
+  } else if (args.requestedIntent === "draft_structure") {
+    const payload = actionPayload?.draftStructure;
+    const projectId = payload?.projectId ?? args.bookId;
+    if (!projectId) throw new ApiError(400, "INVALID_ID", "interactive-film action requires a project id (bookId)");
+    const agentCtx = args.pipeline.createAgentContext("film-authoring", projectId);
+    const deps = filmLLMDepsFromClient(agentCtx.client, agentCtx.model);
+    tool = createDraftStructureTool(args.root, projectId, deps);
+    params = {
+      instruction: payload?.instruction?.trim() || args.instruction,
+    };
+  } else if (args.requestedIntent === "connect_choice") {
+    const payload = actionPayload?.connectChoice;
+    if (!payload?.node) {
+      throw new ApiError(400, "CONFIRMED_ACTION_PAYLOAD_INCOMPLETE", "确认连接选择缺少节点数据，请重新生成确认卡。");
+    }
+    const projectId = payload?.projectId ?? args.bookId;
+    if (!projectId) throw new ApiError(400, "INVALID_ID", "interactive-film action requires a project id (bookId)");
+    tool = createConnectChoiceTool(args.root, projectId);
+    params = {
+      node: payload.node,
+    };
+  } else if (args.requestedIntent === "remove_node") {
+    const payload = actionPayload?.removeNode;
+    if (!payload?.nodeId) {
+      throw new ApiError(400, "CONFIRMED_ACTION_PAYLOAD_INCOMPLETE", "确认删除节点缺少 nodeId，请重新生成确认卡。");
+    }
+    const projectId = payload?.projectId ?? args.bookId;
+    if (!projectId) throw new ApiError(400, "INVALID_ID", "interactive-film action requires a project id (bookId)");
+    tool = createRemoveNodeTool(args.root, projectId);
+    params = {
+      nodeId: payload.nodeId,
     };
   } else {
     throw new ApiError(400, "UNSUPPORTED_CONFIRMED_ACTION", `Unsupported confirmed action: ${args.requestedIntent}`);
@@ -1108,6 +1346,42 @@ async function loadRawConfig(root: string): Promise<Record<string, unknown>> {
 
 async function saveRawConfig(root: string, config: Record<string, unknown>): Promise<void> {
   await writeFile(join(root, "inkos.json"), JSON.stringify(config, null, 2), "utf-8");
+}
+
+type ChapterReviewMode = "auto" | "manual";
+
+function normalizeChapterReviewMode(mode: unknown): ChapterReviewMode {
+  return mode === "manual" ? "manual" : "auto";
+}
+
+function readProjectChapterReviewMode(config: Record<string, unknown>): ChapterReviewMode {
+  const writing = config.writing && typeof config.writing === "object" && !Array.isArray(config.writing)
+    ? config.writing as Record<string, unknown>
+    : {};
+  return normalizeChapterReviewMode(writing.reviewMode);
+}
+
+function readBookChapterReviewMode(rawBook: Record<string, unknown>): ChapterReviewMode | undefined {
+  const writing = rawBook.writing && typeof rawBook.writing === "object" && !Array.isArray(rawBook.writing)
+    ? rawBook.writing as Record<string, unknown>
+    : undefined;
+  if (!writing || writing.reviewMode !== "manual" && writing.reviewMode !== "auto") return undefined;
+  return writing.reviewMode;
+}
+
+async function loadRawBookConfig(root: string, bookId: string): Promise<Record<string, unknown>> {
+  const raw = await readFile(join(root, "books", bookId, "book.json"), "utf-8");
+  return JSON.parse(raw) as Record<string, unknown>;
+}
+
+async function resolveBookChapterReviewMode(root: string, bookId: string | undefined, projectMode: ChapterReviewMode): Promise<ChapterReviewMode> {
+  if (!bookId || !isSafeBookId(bookId)) return projectMode;
+  try {
+    const rawBook = await loadRawBookConfig(root, bookId);
+    return readBookChapterReviewMode(rawBook) ?? projectMode;
+  } catch {
+    return projectMode;
+  }
 }
 
 function unquoteEnvValue(value: string): string {
@@ -1643,7 +1917,7 @@ async function probeServiceCapabilities(args: {
 
 // --- Server factory ---
 
-export function createStudioServer(initialConfig: ProjectConfig, root: string) {
+export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps } = {}) {
   const app = new Hono();
   const state = new StateManager(root);
   let cachedConfig = initialConfig;
@@ -1711,9 +1985,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     overrides?: Partial<Pick<PipelineConfig, "externalContext" | "client" | "model">> & {
       readonly currentConfig?: ProjectConfig;
       readonly sessionIdForSSE?: string;
+      readonly bookIdForSettings?: string;
     },
   ): Promise<PipelineConfig> {
     const currentConfig = overrides?.currentConfig ?? await loadCurrentProjectConfig();
+    const projectReviewMode = readProjectChapterReviewMode(currentConfig as unknown as Record<string, unknown>);
+    const chapterReviewMode = await resolveBookChapterReviewMode(root, overrides?.bookIdForSettings, projectReviewMode);
     const scopedSseSink: LogSink = overrides?.sessionIdForSSE
       ? {
           write(entry) {
@@ -1734,7 +2011,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       defaultLLMConfig: currentConfig.llm,
       foundationReviewRetries: currentConfig.foundation?.reviewRetries ?? 2,
       writingReviewRetries: currentConfig.writing?.reviewRetries ?? 1,
-      chapterReviewMode: (currentConfig.writing as { readonly reviewMode?: string } | undefined)?.reviewMode === "manual" ? "manual" : "auto",
+      chapterReviewMode,
       modelOverrides: currentConfig.modelOverrides,
       temperatureOverrides: currentConfig.temperatureOverrides,
       notifyChannels: currentConfig.notify,
@@ -2080,7 +2357,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     broadcast("write:start", { bookId: id });
 
     // Fire and forget — progress/completion/errors pushed via SSE
-    const pipeline = new PipelineRunner(await buildPipelineConfig());
+    const pipeline = new PipelineRunner(await buildPipelineConfig({ bookIdForSettings: id }));
     pipeline.writeNextChapter(id, body.wordCount).then(
       (result) => {
         broadcast("write:complete", { bookId: id, chapterNumber: result.chapterNumber, status: result.status, title: result.title, wordCount: result.wordCount });
@@ -2679,9 +2956,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
   // --- Project info ---
 
   app.get("/api/v1/project", async (c) => {
-    const currentConfig = await loadCurrentProjectConfig({ requireApiKey: false });
-    // Check if language was explicitly set in inkos.json (not just the schema default)
-    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    let currentConfig: ProjectConfig;
+    let raw: Record<string, unknown>;
+    try {
+      currentConfig = await loadCurrentProjectConfig({ requireApiKey: false });
+      // Check if language was explicitly set in inkos.json (not just the schema default)
+      raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8")) as Record<string, unknown>;
+    } catch (error) {
+      throw new ApiError(
+        500,
+        "PROJECT_CONFIG_INVALID",
+        `Failed to load inkos.json: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     const languageExplicit = "language" in raw && raw.language !== "";
 
     return c.json({
@@ -2710,6 +2997,42 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     } catch {
       return c.notFound();
     }
+  });
+
+  app.get("/api/v1/project/artifacts/:file{.+}", async (c) => {
+    const file = resolveProjectTextArtifactFile(root, c.req.param("file"));
+
+    try {
+      const content = await readFile(file.resolved, "utf-8");
+      return c.json({
+        path: file.relPath,
+        content,
+        contentType: file.contentType,
+        size: Buffer.byteLength(content, "utf-8"),
+      });
+    } catch {
+      return c.notFound();
+    }
+  });
+
+  app.put("/api/v1/project/artifacts/:file{.+}", async (c) => {
+    const file = resolveProjectTextArtifactFile(root, c.req.param("file"));
+    const body = await c.req.json<unknown>().catch(() => null);
+    const content = body && typeof body === "object" && "content" in body
+      ? (body as { readonly content?: unknown }).content
+      : undefined;
+    if (typeof content !== "string") {
+      throw new ApiError(400, "INVALID_PROJECT_ARTIFACT_BODY", "content must be a string");
+    }
+
+    await mkdir(dirname(file.resolved), { recursive: true });
+    await writeFile(file.resolved, content, "utf-8");
+    return c.json({
+      ok: true,
+      path: file.relPath,
+      contentType: file.contentType,
+      size: Buffer.byteLength(content, "utf-8"),
+    });
   });
 
   // --- Config editing ---
@@ -3246,7 +3569,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         bookSession = updatedSession;
       }
       let activeBookConfig: { readonly language?: string } | null = null;
-      if (agentBookId) {
+      if (agentBookId && sessionKind !== "interactive-film-authoring") {
         try {
           activeBookConfig = await state.loadBookConfig(agentBookId);
         } catch {
@@ -3412,6 +3735,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         model: reqModel ?? config.llm.model,
         currentConfig: config,
         sessionIdForSSE: bookSession.sessionId,
+        bookIdForSettings: activeBookId ?? undefined,
       }));
 
       if (requestedIntent && isConfirmedProductionAction({ actionSource, requestedIntent })) {
@@ -3432,6 +3756,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
             pipeline,
             root,
             sessionId: bookSession.sessionId,
+            bookId: agentBookId,
             streamSessionId,
             instruction,
             requestedIntent,
@@ -3464,6 +3789,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
           }
 
           const responseText = exec.result ?? "已完成。";
+          const responseForUser = suppressManualTextForTool(exec) ? "" : responseText;
           await appendManualSessionMessages(root, bookSession.sessionId, [
             manualToolAssistantMessage(
               responseText,
@@ -3475,7 +3801,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
           await refreshBookSessionFromTranscript();
           broadcast("agent:complete", { instruction, activeBookId: createdBookId ?? agentBookId, sessionId: bookSession.sessionId, sessionKind });
           return c.json({
-            response: responseText,
+            response: responseForUser,
+            details: { toolExecutions: [exec] },
             session: {
               sessionId: bookSession.sessionId,
               sessionKind,
@@ -3809,6 +4136,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
               sessionKind,
               ...(bookSession.bookId ? { activeBookId: bookSession.bookId } : {}),
             },
+            details: { toolExecutions: collectedToolExecs },
           });
         }
 
@@ -4114,22 +4442,113 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     return c.json({ ok: true });
   });
 
+  // --- Global default model ---
+
+  app.get("/api/v1/project/default-model", async (c) => {
+    const raw = await loadRawConfig(root);
+    const llm = raw.llm && typeof raw.llm === "object" && !Array.isArray(raw.llm)
+      ? raw.llm as Record<string, unknown>
+      : {};
+    return c.json({
+      service: typeof llm.service === "string" ? llm.service : null,
+      defaultModel: typeof llm.defaultModel === "string" && llm.defaultModel.trim()
+        ? llm.defaultModel
+        : typeof llm.model === "string" && llm.model.trim()
+          ? llm.model
+          : null,
+    });
+  });
+
+  app.put("/api/v1/project/default-model", async (c) => {
+    const body = await c.req.json<{ defaultModel?: string; service?: string }>();
+    const defaultModel = typeof body.defaultModel === "string" ? body.defaultModel.trim() : "";
+    if (!defaultModel) return c.json({ error: "defaultModel is required" }, 400);
+    const raw = await loadRawConfig(root);
+    raw.llm = raw.llm && typeof raw.llm === "object" && !Array.isArray(raw.llm) ? raw.llm : {};
+    const llm = raw.llm as Record<string, unknown>;
+    llm.defaultModel = defaultModel;
+    if (typeof body.service === "string" && body.service.trim()) {
+      llm.service = body.service.trim();
+    }
+    syncTopLevelLlmMirror(llm);
+    await saveRawConfig(root, raw);
+    return c.json({
+      ok: true,
+      service: typeof llm.service === "string" ? llm.service : null,
+      defaultModel,
+    });
+  });
+
   // --- Chapter review mode (C4a: auto pipeline vs manual checkpoint) ---
 
   app.get("/api/v1/project/chapter-review-mode", async (c) => {
-    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
-    return c.json({ mode: raw.writing?.reviewMode === "manual" ? "manual" : "auto" });
+    const raw = await loadRawConfig(root);
+    return c.json({ mode: readProjectChapterReviewMode(raw) });
   });
 
   app.put("/api/v1/project/chapter-review-mode", async (c) => {
     const { mode } = await c.req.json<{ mode?: string }>();
-    const next = mode === "manual" ? "manual" : "auto";
-    const configPath = join(root, "inkos.json");
-    const raw = JSON.parse(await readFile(configPath, "utf-8"));
+    const next = normalizeChapterReviewMode(mode);
+    const raw = await loadRawConfig(root);
     raw.writing = { ...(raw.writing ?? {}), reviewMode: next };
-    const { writeFile: writeFileFs } = await import("node:fs/promises");
-    await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
+    await saveRawConfig(root, raw);
     return c.json({ ok: true, mode: next });
+  });
+
+  app.get("/api/v1/books/:id/chapter-review-mode", async (c) => {
+    const bookId = c.req.param("id");
+    if (!isSafeBookId(bookId)) return c.json({ error: "Invalid book id" }, 400);
+    try {
+      const [projectConfig, rawBook] = await Promise.all([
+        loadRawConfig(root),
+        loadRawBookConfig(root, bookId),
+      ]);
+      const projectMode = readProjectChapterReviewMode(projectConfig);
+      const bookMode = readBookChapterReviewMode(rawBook);
+      return c.json({
+        mode: bookMode ?? projectMode,
+        bookMode: bookMode ?? null,
+        projectMode,
+      });
+    } catch {
+      return c.json({ error: `Book "${bookId}" not found` }, 404);
+    }
+  });
+
+  app.put("/api/v1/books/:id/chapter-review-mode", async (c) => {
+    const bookId = c.req.param("id");
+    if (!isSafeBookId(bookId)) return c.json({ error: "Invalid book id" }, 400);
+    const { mode } = await c.req.json<{ mode?: string }>();
+    const rawBookPath = join(root, "books", bookId, "book.json");
+    try {
+      const [projectConfig, rawBook] = await Promise.all([
+        loadRawConfig(root),
+        loadRawBookConfig(root, bookId),
+      ]);
+      const projectMode = readProjectChapterReviewMode(projectConfig);
+      if (mode === "inherit") {
+        const writing = rawBook.writing && typeof rawBook.writing === "object" && !Array.isArray(rawBook.writing)
+          ? { ...(rawBook.writing as Record<string, unknown>) }
+          : {};
+        delete writing.reviewMode;
+        rawBook.writing = Object.keys(writing).length > 0 ? writing : undefined;
+      } else {
+        rawBook.writing = {
+          ...(rawBook.writing && typeof rawBook.writing === "object" && !Array.isArray(rawBook.writing) ? rawBook.writing as Record<string, unknown> : {}),
+          reviewMode: normalizeChapterReviewMode(mode),
+        };
+      }
+      await writeFile(rawBookPath, JSON.stringify(rawBook, null, 2), "utf-8");
+      const bookMode = readBookChapterReviewMode(rawBook);
+      return c.json({
+        ok: true,
+        mode: bookMode ?? projectMode,
+        bookMode: bookMode ?? null,
+        projectMode,
+      });
+    } catch {
+      return c.json({ error: `Book "${bookId}" not found` }, 404);
+    }
   });
 
   // --- Notify channels ---
@@ -4754,6 +5173,85 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     } catch { /* slow/unreachable upstream — leave llmConnected false */ }
 
     return c.json(checks);
+  });
+
+  app.post("/api/v1/projects/:id/story-graph/delta", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) {
+      return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    }
+    const { delta } = await c.req.json<{ delta: unknown }>();
+    const { graph, rev } = await applyGraphDelta({ projectRoot: root, projectId: id, delta: delta as never });
+    return c.json({ rev, graph });
+  });
+
+  app.get("/api/v1/projects/:id/story-graph", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) {
+      return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    }
+    const graphPath = join(root, "interactive-films", id, "story-graph.json");
+    try {
+      const raw = await readFile(graphPath, "utf-8");
+      return c.json(JSON.parse(raw));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
+      }
+      throw error;
+    }
+  });
+
+  app.get("/api/v1/projects/:id/export", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) {
+      return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    }
+    const projectDir = join(root, "interactive-films", id);
+    try {
+      await access(projectDir);
+      const archive = gzipSync(await buildTarArchive(projectDir, id));
+      return new Response(new Uint8Array(archive), {
+        headers: {
+          "Content-Type": "application/gzip",
+          "Content-Disposition": `attachment; filename="${encodeURIComponent(id)}.tar.gz"`,
+        },
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return c.json({ error: { code: "NOT_FOUND", message: `interactive film project not found for ${id}` } }, 404);
+      }
+      throw error;
+    }
+  });
+
+  app.get("/api/v1/projects/:id/story-graph/validation", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) {
+      return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    }
+    const graph = await loadStoryGraph(root, id);
+    if (!graph) {
+      return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
+    }
+    return c.json(reviewStoryGraph(graph));
+  });
+
+  app.post("/api/v1/projects/:id/nodes/:nodeId/image", async (c) => {
+    const id = c.req.param("id");
+    const nodeId = c.req.param("nodeId");
+    if (!isSafeBookId(id)) {
+      return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    }
+    const graph = await loadStoryGraph(root, id);
+    const node = graph?.nodes.find((n) => n.id === nodeId);
+    if (!node) {
+      return c.json({ error: { code: "NODE_NOT_FOUND", message: `node ${nodeId} not found` } }, 404);
+    }
+    const deps = overrides.nodeImageGenerator ?? (await defaultNodeImageDeps(root));
+    const { assetRef, delta } = await generateNodeImage({ projectRoot: root, projectId: id, node, deps });
+    const { rev } = await applyGraphDelta({ projectRoot: root, projectId: id, delta });
+    return c.json({ assetRef, rev });
   });
 
   return app;
