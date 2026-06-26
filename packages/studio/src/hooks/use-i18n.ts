@@ -264,6 +264,9 @@ const strings = {
   "settings.detectionThreshold": { zh: "阈值", en: "Threshold" },
   "settings.detectionMaxRetries": { zh: "最大重试", en: "Max retries" },
   "settings.detectionAutoRewrite": { zh: "命中后自动反检测改写", en: "Auto anti-detect rewrite on hit" },
+  "settings.temperatureOverrides": { zh: "Agent 温度调控", en: "Agent Temperature Tuning" },
+  "settings.temperatureOverridesHint": { zh: "调控各个 Agent 的创造性与发散性温度。较高的温度（例如 0.8 以上）能让输出更有灵感，但随机性增加可能影响格式或连贯性；较低的温度（例如 0.3 以下）结果更严谨稳定。注：对于结算、格式化等高确定性底层逻辑，系统会自动保护不受此处的温度覆盖影响。", en: "Adjust the creative and divergence temperature of each agent. High temperatures (e.g., above 0.8) spark inspiration but risk formatting or consistency issues; low temperatures (e.g., below 0.3) ensure rigorous stability. Note: High certainty low-level logic such as settlement will be automatically protected." },
+  "settings.temperatureDefault": { zh: "系统默认", en: "Default" },
 
   // Truth Files extras
   "truth.title": { zh: "真相文件", en: "Truth Files" },

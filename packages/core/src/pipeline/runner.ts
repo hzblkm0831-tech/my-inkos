@@ -263,6 +263,7 @@ export interface PipelineConfig {
   readonly radarSources?: ReadonlyArray<RadarSource>;
   readonly externalContext?: string;
   readonly modelOverrides?: Record<string, string | AgentLLMOverride>;
+  readonly temperatureOverrides?: Record<string, number>;
   readonly inputGovernanceMode?: InputGovernanceMode;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
@@ -617,6 +618,7 @@ export class PipelineRunner {
       bookId,
       logger: this.config.logger?.child(agent),
       onStreamProgress: this.config.onStreamProgress,
+      temperature: this.config.temperatureOverrides?.[agent] ?? undefined,
     };
   }
 

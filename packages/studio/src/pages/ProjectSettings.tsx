@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bell, Bot, Radar, Settings2, Plus, Trash2 } from "lucide-react";
+import { Bell, Bot, Radar, Settings2, Plus, Trash2, Thermometer } from "lucide-react";
 import { fetchJson, putApi, useApi } from "../hooks/use-api";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
@@ -66,10 +66,22 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
   const { data: notifyData, refetch: refetchNotify } = useApi<{ channels: unknown[] }>("/project/notify");
   const { data: modeData, refetch: refetchMode } = useApi<{ mode: "legacy" | "v2" }>("/project/input-governance-mode");
   const { data: detectionData, refetch: refetchDetection } = useApi<{ detection: unknown | null }>("/project/detection");
+  const { data: tempOverridesData, refetch: refetchTempOverrides } = useApi<{ overrides: Record<string, number> }>("/project/temperature-overrides");
+
+  const presetAgents = [
+    { key: "writer", label: "Writer (写手)", defaultVal: 0.7 },
+    { key: "auditor", label: "Auditor (审查员)", defaultVal: 0.3 },
+    { key: "architect", label: "Architect (架构师)", defaultVal: 0.7 },
+    { key: "reviser", label: "Reviser (修改员)", defaultVal: 0.4 },
+    { key: "planner", label: "Planner (计划员)", defaultVal: 0.7 },
+  ];
+
   const [mode, setMode] = useState<"legacy" | "v2">("v2");
   const [overrideRows, setOverrideRows] = useState<OverrideRow[]>([]);
   const [notifyChannels, setNotifyChannels] = useState<NotifyChannelDraft[]>([]);
   const [det, setDet] = useState<DetectionDraft>({ ...DEFAULT_DETECTION });
+  const [tempOverrides, setTempOverrides] = useState<Record<string, number>>({});
+  const [customTempRows, setCustomTempRows] = useState<Array<{ agent: string; value: number }>>([]);
   const [notice, setNotice] = useState<{ tone: NoticeTone; message: string } | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
 
@@ -95,6 +107,23 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
     if (!detectionData) return;
     setDet(detectionDraftFromConfig(detectionData.detection));
   }, [detectionData]);
+
+  useEffect(() => {
+    if (!tempOverridesData?.overrides) return;
+    const raw = tempOverridesData.overrides;
+    const presets: Record<string, number> = {};
+    const customs: Array<{ agent: string; value: number }> = [];
+    const presetKeys = presetAgents.map((a) => a.key);
+    for (const [key, val] of Object.entries(raw)) {
+      if (presetKeys.includes(key)) {
+        presets[key] = val;
+      } else {
+        customs.push({ agent: key, value: val });
+      }
+    }
+    setTempOverrides(presets);
+    setCustomTempRows(customs);
+  }, [tempOverridesData]);
 
   const runSave = async (key: string, work: () => Promise<void>, success: string) => {
     setSaving(key);
@@ -223,6 +252,137 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
           </button>
           <button onClick={nav.toServices} className={`rounded-lg px-4 py-2 text-sm font-bold ${c.btnSecondary}`}>
             {t("settings.openModelConfig")}
+          </button>
+        </div>
+      </SettingsCard>
+
+      {/* Temperature overrides */}
+      <SettingsCard title={t("settings.temperatureOverrides")} description={t("settings.temperatureOverridesHint")} icon={<Thermometer size={18} />}>
+        <div className="space-y-4">
+          {presetAgents.map((agent) => {
+            const isEnabled = tempOverrides[agent.key] !== undefined;
+            const value = tempOverrides[agent.key] ?? agent.defaultVal;
+            return (
+              <div key={agent.key} className="flex flex-col sm:flex-row sm:items-center gap-3 border-b border-border/30 pb-3 last:border-b-0 last:pb-0">
+                <div className="sm:w-48 flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id={`temp-enable-${agent.key}`}
+                    checked={isEnabled}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setTempOverrides((prev) => {
+                        const next = { ...prev };
+                        if (checked) {
+                          next[agent.key] = agent.defaultVal;
+                        } else {
+                          delete next[agent.key];
+                        }
+                        return next;
+                      });
+                    }}
+                    className="rounded text-primary focus:ring-primary/30"
+                  />
+                  <label htmlFor={`temp-enable-${agent.key}`} className="text-sm font-semibold select-none cursor-pointer">
+                    {agent.label}
+                  </label>
+                </div>
+
+                <div className="flex-1 flex items-center gap-3">
+                  <input
+                    type="range"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    disabled={!isEnabled}
+                    value={value}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setTempOverrides((prev) => ({
+                        ...prev,
+                        [agent.key]: val,
+                      }));
+                    }}
+                    className="flex-1 h-1.5 rounded-lg bg-border accent-primary outline-none disabled:opacity-40"
+                  />
+                  <span className={`w-24 text-right font-mono text-sm ${isEnabled ? "text-foreground font-bold" : "text-muted-foreground"}`}>
+                    {isEnabled ? value.toFixed(2) : t("settings.temperatureDefault")}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Custom agent temperatures */}
+          {customTempRows.length > 0 && (
+            <div className="space-y-3 pt-3 border-t border-border/40">
+              <h3 className="text-xs font-bold text-muted-foreground uppercase tracking-wider">自定义 Agent 温度</h3>
+              {customTempRows.map((row, i) => (
+                <div key={i} className="flex items-center gap-3">
+                  <input
+                    value={row.agent}
+                    onChange={(e) => setCustomTempRows((prev) => prev.map((r, j) => (j === i ? { ...r, agent: e.target.value } : r)))}
+                    placeholder={t("settings.agentName")}
+                    className={`${fieldClass} sm:w-48`}
+                  />
+                  <div className="flex-1 flex items-center gap-3">
+                    <input
+                      type="range"
+                      min="0"
+                      max="2"
+                      step="0.05"
+                      value={row.value}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value);
+                        setCustomTempRows((prev) => prev.map((r, j) => (j === i ? { ...r, value: val } : r)));
+                      }}
+                      className="flex-1 h-1.5 rounded-lg bg-border accent-primary outline-none"
+                    />
+                    <span className="w-12 text-right font-mono text-sm text-foreground font-bold">
+                      {row.value.toFixed(2)}
+                    </span>
+                    <button
+                      onClick={() => setCustomTempRows((prev) => prev.filter((_, j) => j !== i))}
+                      className="shrink-0 rounded-lg p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
+                      aria-label="remove"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-wrap gap-2 pt-2">
+          <button
+            onClick={() => setCustomTempRows((prev) => [...prev, { agent: "", value: 0.7 }])}
+            className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium ${c.btnSecondary}`}
+          >
+            <Plus size={14} /> 添加自定义 Agent
+          </button>
+          <button
+            onClick={() => runSave("temp-overrides", async () => {
+              const overrides: Record<string, number> = {};
+              for (const a of presetAgents) {
+                if (tempOverrides[a.key] !== undefined) {
+                  overrides[a.key] = tempOverrides[a.key]!;
+                }
+              }
+              for (const row of customTempRows) {
+                const agent = row.agent.trim();
+                if (agent && !presetAgents.map((a) => a.key).includes(agent)) {
+                  overrides[agent] = row.value;
+                }
+              }
+              await putApi("/project/temperature-overrides", { overrides });
+              await refetchTempOverrides();
+            }, t("settings.saved"))}
+            disabled={saving === "temp-overrides"}
+            className={`rounded-lg px-4 py-2 text-sm font-bold ${c.btnPrimary} disabled:opacity-40`}
+          >
+            {saving === "temp-overrides" ? t("config.saving") : t("config.save")}
           </button>
         </div>
       </SettingsCard>

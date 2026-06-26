@@ -401,7 +401,7 @@ const SubAgentParams = Type.Object({
     Type.Literal("reviser"),
     Type.Literal("exporter"),
   ]),
-  instruction: Type.String({ description: "Natural language instruction for the sub-agent" }),
+  instruction: Type.Optional(Type.String({ description: "Natural language instruction for the sub-agent" })),
   bookId: Type.Optional(Type.String({
     description: "Optional book ID. In active-book sessions, omit it to use the current active book; if provided, it must match the current active book. For architect creation, this optionally sets the new book ID.",
   })),
@@ -533,7 +533,7 @@ export function createSubAgentTool(
               }
               const targetBookId = resolveToolBookId("architect", bookId, activeBookId);
               progress(`Revising foundation for "${targetBookId}"...`);
-              await pipeline.reviseFoundation(targetBookId, feedback ?? instruction);
+              await pipeline.reviseFoundation(targetBookId, feedback ?? instruction ?? "");
               progress(`Foundation revised for "${targetBookId}".`);
               return textResult(
                 `Book "${targetBookId}" 架构稿已按要求重写。原书的条目式架构稿已备份到 story/.backup-phase4-<时间戳>/。`,
@@ -648,12 +648,12 @@ export function createSubAgentTool(
           case "exporter": {
             const targetBookId = resolveToolBookId("exporter", bookId, activeBookId);
             if (!projectRoot) return textResult("Error: exporter requires projectRoot.");
-            const inferredFormat = format ?? (/epub/i.test(instruction)
+            const inferredFormat = format ?? (instruction && /epub/i.test(instruction)
               ? "epub"
-              : /markdown|\bmd\b/i.test(instruction)
+              : instruction && /markdown|\bmd\b/i.test(instruction)
                 ? "md"
                 : "txt");
-            const exportApprovedOnly = approvedOnly ?? /approved|已通过|通过章节/.test(instruction);
+            const exportApprovedOnly = approvedOnly ?? (instruction ? /approved|已通过|通过章节/.test(instruction) : false);
             const state = new StateManager(projectRoot);
             const result = await writeExportArtifact(state, targetBookId, {
               format: inferredFormat,

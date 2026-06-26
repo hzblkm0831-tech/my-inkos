@@ -125,6 +125,7 @@ export const ProjectConfigSchema = z.object({
     reviewRetries: 1,
   }),
   modelOverrides: z.record(z.string(), ModelOverrideValueSchema).optional(),
+  temperatureOverrides: z.record(z.string(), z.number().min(0).max(2)).optional(),
   inputGovernanceMode: InputGovernanceModeSchema.default("v2"),
   daemon: z.object({
     schedule: z.object({

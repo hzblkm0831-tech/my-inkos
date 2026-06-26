@@ -1736,6 +1736,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       writingReviewRetries: currentConfig.writing?.reviewRetries ?? 1,
       chapterReviewMode: (currentConfig.writing as { readonly reviewMode?: string } | undefined)?.reviewMode === "manual" ? "manual" : "auto",
       modelOverrides: currentConfig.modelOverrides,
+      temperatureOverrides: currentConfig.temperatureOverrides,
       notifyChannels: currentConfig.notify,
       logger,
       onContextCompression: (event) => {
@@ -2282,7 +2283,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
             service: secretKey,
             label: svc.name ?? "Custom",
             group: undefined,
-            connected: Boolean(secrets.services[secretKey]?.apiKey),
+            connected: true,
           });
         }
       }
@@ -2621,13 +2622,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         baseUrl: s.baseUrl ?? "",
         label: s.name ?? "Custom",
       }))
-      .filter((s) => s.baseUrl && Boolean(secrets.services[s.id]?.apiKey));
+      .filter((s) => s.baseUrl);
 
     const groups = await Promise.all(customs.map(async (s) => ({
       service: s.id,
       label: s.label,
       models: filterTextChatModels(
-        await probeModelsFromUpstream(s.baseUrl, secrets.services[s.id].apiKey, 10_000),
+        await probeModelsFromUpstream(s.baseUrl, secrets.services[s.id]?.apiKey || process.env.INKOS_LLM_API_KEY || "fake-key", 10_000),
       ),
     })));
 
@@ -4091,6 +4092,23 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const configPath = join(root, "inkos.json");
     const raw = JSON.parse(await readFile(configPath, "utf-8"));
     raw.modelOverrides = overrides;
+    const { writeFile: writeFileFs } = await import("node:fs/promises");
+    await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
+    return c.json({ ok: true });
+  });
+
+  // --- Temperature overrides ---
+
+  app.get("/api/v1/project/temperature-overrides", async (c) => {
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    return c.json({ overrides: raw.temperatureOverrides ?? {} });
+  });
+
+  app.put("/api/v1/project/temperature-overrides", async (c) => {
+    const { overrides } = await c.req.json<{ overrides: Record<string, number> }>();
+    const configPath = join(root, "inkos.json");
+    const raw = JSON.parse(await readFile(configPath, "utf-8"));
+    raw.temperatureOverrides = overrides;
     const { writeFile: writeFileFs } = await import("node:fs/promises");
     await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
     return c.json({ ok: true });

@@ -275,7 +275,7 @@ export class WriterAgent extends BaseAgent {
           });
         })();
 
-    const creativeTemperature = input.temperatureOverride ?? 0.7;
+    const creativeTemperature = input.temperatureOverride ?? this.ctx.temperature ?? 0.7;
 
     this.logInfo(resolvedLanguage, {
       zh: `阶段 1：创作正文（第${chapterNumber}章）`,

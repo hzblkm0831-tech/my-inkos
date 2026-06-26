@@ -322,4 +322,34 @@ describe("loadProjectConfig local provider auth", () => {
     expect(config.llm.model).toBe("gpt-5.4");
     expect(config.llm.apiKey).toBe("sk-env");
   });
+
+  it("successfully parses temperatureOverrides from project config", async () => {
+    root = await mkdtemp(join(tmpdir(), "inkos-config-loader-temp-overrides-"));
+    for (const key of ENV_KEYS) {
+      previousEnv.set(key, process.env[key]);
+      process.env[key] = "";
+    }
+
+    await writeFile(join(root, "inkos.json"), JSON.stringify({
+      name: "temp-overrides-project",
+      version: "0.1.0",
+      language: "zh",
+      llm: {
+        provider: "openai",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "gpt-oss:20b",
+      },
+      temperatureOverrides: {
+        writer: 1.15,
+        auditor: 0.05,
+      },
+    }, null, 2), "utf-8");
+    await writeFile(join(root, ".env"), "", "utf-8");
+
+    const config = await loadProjectConfig(root);
+    expect(config.temperatureOverrides).toEqual({
+      writer: 1.15,
+      auditor: 0.05,
+    });
+  });
 });

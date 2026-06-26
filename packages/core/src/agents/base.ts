@@ -10,6 +10,7 @@ export interface AgentContext {
   readonly bookId?: string;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
+  readonly temperature?: number;
 }
 
 export abstract class BaseAgent {
@@ -27,8 +28,15 @@ export abstract class BaseAgent {
     messages: ReadonlyArray<LLMMessage>,
     options?: { readonly temperature?: number; readonly maxTokens?: number },
   ): Promise<LLMResponse> {
+    let temperature = options?.temperature;
+    if (this.ctx.temperature !== undefined) {
+      if (temperature === undefined || temperature >= 0.4) {
+        temperature = this.ctx.temperature;
+      }
+    }
     return chatCompletion(this.ctx.client, this.ctx.model, messages, {
       ...options,
+      ...(temperature !== undefined ? { temperature } : {}),
       onStreamProgress: this.ctx.onStreamProgress,
     });
   }
@@ -44,8 +52,15 @@ export abstract class BaseAgent {
   ): Promise<LLMResponse> {
     // OpenAI has native search — use it directly
     if (this.ctx.client.provider === "openai") {
+      let temperature = options?.temperature;
+      if (this.ctx.temperature !== undefined) {
+        if (temperature === undefined || temperature >= 0.4) {
+          temperature = this.ctx.temperature;
+        }
+      }
       return chatCompletion(this.ctx.client, this.ctx.model, messages, {
         ...options,
+        ...(temperature !== undefined ? { temperature } : {}),
         webSearch: true,
         onStreamProgress: this.ctx.onStreamProgress,
       });
